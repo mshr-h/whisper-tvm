@@ -1,0 +1,10 @@
+numpy
+scipy
+soundfile
+transformers
+torch
+fastapi
+uvicorn
+python-multipart
+git+https://github.com/mshr-h/tokenizers-tvm-ffi.git
+# Install Apache TVM separately.
