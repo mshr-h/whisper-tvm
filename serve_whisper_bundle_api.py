@@ -42,6 +42,8 @@ def make_app(args):
             "compression_ratio_threshold",
             "logprob_threshold",
             "no_speech_threshold",
+            "eos_timestamp_margin",
+            "skip_final_tail_s",
             "stream",
         }
         if task == "transcribe":
@@ -96,6 +98,8 @@ def make_app(args):
             )
             logprob_threshold = parse_optional_float("logprob_threshold", -1.0)
             no_speech_threshold = parse_optional_float("no_speech_threshold", 0.6)
+            eos_timestamp_margin = parse_optional_float("eos_timestamp_margin", 0.0)
+            skip_final_tail_s = parse_optional_float("skip_final_tail_s", 0.0)
         except ValueError as e:
             return err(str(e))
         if str(form.get("stream") or "false").lower() in {"1", "true", "yes", "on"}:
@@ -137,6 +141,8 @@ def make_app(args):
                     compression_ratio_threshold=compression_ratio_threshold,
                     logprob_threshold=logprob_threshold,
                     no_speech_threshold=no_speech_threshold,
+                    eos_timestamp_margin_s=eos_timestamp_margin,
+                    skip_final_tail_s=skip_final_tail_s,
                 )
         except ValueError as e:
             return err(str(e))

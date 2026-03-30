@@ -359,9 +359,6 @@ class WhisperBundleRunner:
         )
         self.max_past_len = int(self.meta["max_dec_len_compiled"]) - 1
         self.max_decode_batch = int(self.meta.get("max_decode_batch", 1))
-        self.max_prompt_prefill_len = int(
-            self.meta.get("max_prompt_prefill_len", 0) or 0
-        )
         self.self_shape = (
             int(self.meta["decoder_layers"]),
             self.max_decode_batch,
@@ -372,6 +369,10 @@ class WhisperBundleRunner:
         self.load_time_ms = (time.perf_counter() - init_started) * 1000.0
         self.last_perf: BundlePerfStats | None = None
         self.collect_perf = False
+        self._window_valid_samples = 0
+        self._window_is_last = False
+        self._eos_timestamp_margin_s = 0.0
+        self._skip_final_tail_s = 0.0
 
     def _reset_perf(self, enabled: bool = False):
         self.collect_perf = bool(enabled)
@@ -718,55 +719,6 @@ class WhisperBundleRunner:
         self_v = to_tvm(np.zeros(self.self_shape, dtype=self.cache_np_dtype), self.dev)
         return self_k, self_v
 
-    def _pack_prefill_prompt(self, prompt_ids: Sequence[int]):
-        prompt_len = len(prompt_ids)
-        if prompt_len <= 0:
-            raise ValueError("prompt_ids must be non-empty")
-        if self.max_prompt_prefill_len <= 0:
-            raise ValueError("This bundle does not support decode_prefill")
-        if prompt_len > self.max_prompt_prefill_len:
-            raise ValueError(
-                f"prompt length {prompt_len} exceeds compiled max_prompt_prefill_len={self.max_prompt_prefill_len}"
-            )
-        token_pad = np.full(
-            (1, self.max_prompt_prefill_len),
-            int(self.eos),
-            dtype=np.int32,
-        )
-        position_pad = np.zeros((1, self.max_prompt_prefill_len), dtype=np.int32)
-        token_pad[0, :prompt_len] = np.asarray(prompt_ids, dtype=np.int32)
-        position_pad[0, :prompt_len] = np.arange(prompt_len, dtype=np.int32)
-        return token_pad, position_pad, prompt_len
-
-    def _prefill_to_self_cache(
-        self,
-        prefill_k,
-        prefill_v,
-        prompt_len: int,
-        active_count: int,
-    ):
-        if active_count <= 0:
-            raise ValueError("active_count must be positive")
-        keep = max(0, min(int(prompt_len), self.max_past_len))
-        self_k = np.zeros(self.self_shape, dtype=self.cache_np_dtype)
-        self_v = np.zeros(self.self_shape, dtype=self.cache_np_dtype)
-        if keep > 0:
-            prefill_k_np = np.asarray(
-                unwrap(prefill_k).numpy(), dtype=self.cache_np_dtype
-            )
-            prefill_v_np = np.asarray(
-                unwrap(prefill_v).numpy(), dtype=self.cache_np_dtype
-            )
-            tail_k = prefill_k_np[:, 0:1, :, prompt_len - keep : prompt_len, :]
-            tail_v = prefill_v_np[:, 0:1, :, prompt_len - keep : prompt_len, :]
-            self_k[:, :active_count, :, -keep:, :] = np.repeat(
-                tail_k, active_count, axis=1
-            )
-            self_v[:, :active_count, :, -keep:, :] = np.repeat(
-                tail_v, active_count, axis=1
-            )
-        return to_tvm(self_k, self.dev), to_tvm(self_v, self.dev)
-
     def _make_past_keep_mask(
         self, positions: Sequence[int], active_count: int
     ) -> np.ndarray:
@@ -876,30 +828,7 @@ class WhisperBundleRunner:
         if active_count <= 0:
             raise ValueError("active_count must be positive")
 
-        def _run_prompt_prefill():
-            token_pad, position_pad, prompt_len = self._pack_prefill_prompt(prompt_ids)
-            logits, prefill_k, prefill_v = unwrap_many(
-                self.vm["decode_prefill"](
-                    to_tvm(token_pad, self.dev),
-                    to_tvm(position_pad, self.dev),
-                    cross_k,
-                    cross_v,
-                    self.params,
-                )
-            )
-            logits_np = np.asarray(unwrap(logits).numpy(), dtype=np.float32)
-            last_logits = np.repeat(
-                logits_np[:, prompt_len - 1, :], active_count, axis=0
-            )
-            self_k, self_v = self._prefill_to_self_cache(
-                prefill_k,
-                prefill_v,
-                prompt_len,
-                active_count,
-            )
-            return last_logits, self_k, self_v, prompt_len
-
-        def _run_prompt_stepwise():
+        def _run_prompt():
             self_k, self_v = self._zero_self_cache()
             logits = None
             for pos, token_id in enumerate(prompt_ids):
@@ -917,12 +846,7 @@ class WhisperBundleRunner:
                 raise RuntimeError("Failed to prime decoder.")
             return logits, self_k, self_v, len(prompt_ids)
 
-        use_prefill = (
-            self.max_prompt_prefill_len > 0
-            and 1 < len(prompt_ids) <= self.max_prompt_prefill_len
-        )
-        runner = _run_prompt_prefill if use_prefill else _run_prompt_stepwise
-        result, elapsed_ms = self._time_call(runner)
+        result, elapsed_ms = self._time_call(_run_prompt)
         self._record_metric(metric_name, elapsed_ms)
         return result
 
@@ -946,6 +870,35 @@ class WhisperBundleRunner:
             int(cand[int(np.argmax(logits[0][cand]))]),
             str(self.meta.get("default_language_code", "en")),
         )
+
+    def _latest_generated_timestamp_seconds(
+        self, generated: Sequence[int]
+    ) -> float | None:
+        ts_tokens = [int(x) for x in generated if int(x) >= self.timestamp_begin]
+        if not ts_tokens:
+            return None
+        return float(
+            (int(ts_tokens[-1]) - self.timestamp_begin)
+            * float(self.meta["time_precision"])
+        )
+
+    def _should_block_eos(self, generated: Sequence[int], timestamps: bool) -> bool:
+        if not timestamps:
+            return False
+        if not bool(self._window_is_last):
+            return False
+        margin_s = max(0.0, float(self._eos_timestamp_margin_s))
+        if margin_s <= 0.0:
+            return False
+        valid_samples = max(0, int(self._window_valid_samples))
+        if valid_samples <= 0:
+            return False
+        valid_duration_s = valid_samples / float(self.meta["sample_rate"])
+        target_timestamp_s = max(0.0, valid_duration_s - margin_s)
+        latest_timestamp_s = self._latest_generated_timestamp_seconds(generated)
+        if latest_timestamp_s is None:
+            return True
+        return latest_timestamp_s + 1e-6 < target_timestamp_s
 
     def filter_logits(
         self, logits: np.ndarray, generated: Sequence[int], timestamps: bool
@@ -980,6 +933,8 @@ class WhisperBundleRunner:
                     else ts_tokens[-1] + 1
                 )
             ] = -np.inf
+        if self._should_block_eos(seq, timestamps):
+            logits[self.eos] = -np.inf
         if not seq:
             logits[: self.timestamp_begin] = -np.inf
             limit = self.timestamp_begin + int(
@@ -1340,30 +1295,15 @@ class WhisperBundleRunner:
             )
             if finished_candidates:
                 finished.extend(finished_candidates)
-            if finished:
-                finished.sort(
-                    key=lambda h: self._rank_score(
-                        h.sum_logprob, len(h.tokens), length_penalty
-                    ),
-                    reverse=True,
-                )
-                finished = finished[:beam_size]
+                if len(finished) >= beam_size:
+                    stop_reason = "beam_finished"
+                    active = []
+                    break
             if not active_candidates:
                 stop_reason = "eos" if eos_seen else "all_logits_filtered"
                 active = []
                 break
             active_candidates.sort(key=lambda x: x[0], reverse=True)
-            if length_penalty is None and len(finished) >= beam_size:
-                worst_finished_score = self._rank_score(
-                    finished[-1].sum_logprob,
-                    len(finished[-1].tokens),
-                    length_penalty,
-                )
-                best_active_score = float(active_candidates[0][0])
-                if worst_finished_score >= best_active_score:
-                    stop_reason = "beam_finished"
-                    active = []
-                    break
             survivors = active_candidates[:beam_size]
             parent_indices = [cand[1] for cand in survivors]
             next_tokens = [cand[2] for cand in survivors]
@@ -1531,18 +1471,32 @@ class WhisperBundleRunner:
         return last_attempt
 
     def build_segments(
-        self,
-        ids: Sequence[int],
-        offset_s: float,
-        valid_samples: int,
-        timestamps: bool,
+        self, ids: Sequence[int], offset_s: float, valid_samples: int, timestamps: bool
     ):
+        ids = [int(x) for x in ids]
+        if not ids:
+            return [], valid_samples
+        if not timestamps:
+            text = self.decode_text(ids)
+            return (
+                [
+                    {
+                        "start": float(offset_s),
+                        "end": float(
+                            offset_s + valid_samples / float(self.meta["sample_rate"])
+                        ),
+                        "text": text,
+                        "tokens": ids,
+                    }
+                ]
+                if text.strip()
+                else []
+            ), valid_samples
         arr = np.asarray(ids, dtype=np.int64)
         ts_mask = arr >= self.timestamp_begin
         pair_ends = np.where(ts_mask[:-1] & ts_mask[1:])[0] + 1
         tail_is_single_ts = arr.size >= 2 and ts_mask[-2:].tolist() == [False, True]
         segments, advance = [], valid_samples
-
         if len(pair_ends) > 0:
             last = 0
             for cur in pair_ends.tolist() + ([len(arr)] if tail_is_single_ts else []):
@@ -1594,7 +1548,6 @@ class WhisperBundleRunner:
                         "tokens": ids,
                     }
                 )
-
         if advance <= 0:
             advance = min(
                 valid_samples, max(1, int(self.meta["samples_per_timestamp"]))
@@ -1617,6 +1570,8 @@ class WhisperBundleRunner:
         compression_ratio_threshold: float | None = 2.4,
         logprob_threshold: float | None = -1.0,
         no_speech_threshold: float | None = 0.6,
+        eos_timestamp_margin_s: float = 0.0,
+        skip_final_tail_s: float = 0.0,
         collect_perf: bool = False,
     ):
         self._reset_perf(collect_perf)
@@ -1645,6 +1600,10 @@ class WhisperBundleRunner:
                     break
                 if detected is None:
                     detected = self.detect_language(cross_k, cross_v)
+                self._window_valid_samples = int(valid)
+                self._window_is_last = bool((seek + valid) >= len(audio))
+                self._eos_timestamp_margin_s = max(0.0, float(eos_timestamp_margin_s))
+                self._skip_final_tail_s = max(0.0, float(skip_final_tail_s))
                 prompt = self.build_prompt(
                     detected,
                     task,
@@ -1662,15 +1621,27 @@ class WhisperBundleRunner:
                 )
                 ids = attempt.tokens
                 window_segments, advance = self.build_segments(
-                    ids,
-                    seek / float(sr),
-                    valid,
-                    timestamps,
+                    ids, seek / float(sr), valid, timestamps
                 )
                 seek_advance = int(
                     (advance if timestamps else valid)
                     or min(valid, int(self.meta["samples_per_timestamp"]))
                 )
+                if (
+                    timestamps
+                    and self._window_is_last
+                    and self._skip_final_tail_s > 0.0
+                ):
+                    remaining_after_advance = int(len(audio) - (seek + seek_advance))
+                    tail_skip_samples = int(
+                        round(float(self._skip_final_tail_s) * float(sr))
+                    )
+                    if (
+                        0 < remaining_after_advance <= max(1, tail_skip_samples)
+                        and attempt.ended_with_eos
+                        and attempt.stop_reason in {"beam_finished", "eos"}
+                    ):
+                        seek_advance = int(valid)
                 self._record_window_trace(
                     seek_samples=seek,
                     valid_samples=valid,

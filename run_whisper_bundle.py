@@ -54,6 +54,8 @@ p.add_argument("--length-penalty", type=float)
 p.add_argument("--compression-ratio-threshold", type=float, default=2.4)
 p.add_argument("--logprob-threshold", type=float, default=-1.0)
 p.add_argument("--no-speech-threshold", type=float, default=0.6)
+p.add_argument("--eos-timestamp-margin", type=float, default=0.0)
+p.add_argument("--skip-final-tail-s", type=float, default=0.0)
 p.add_argument("--show-model-info", action="store_true")
 p.add_argument("--show-system-info", action="store_true")
 p.add_argument("--show-perf", "--show-timings", action="store_true")
@@ -110,6 +112,8 @@ result = runner.run(
     compression_ratio_threshold=args.compression_ratio_threshold,
     logprob_threshold=args.logprob_threshold,
     no_speech_threshold=args.no_speech_threshold,
+    eos_timestamp_margin_s=args.eos_timestamp_margin,
+    skip_final_tail_s=args.skip_final_tail_s,
     collect_perf=args.show_perf or args.show_decode_debug,
 )
 

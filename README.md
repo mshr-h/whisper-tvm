@@ -147,6 +147,9 @@ Useful options:
 - `--compression-ratio-threshold FLOAT`
 - `--logprob-threshold FLOAT`
 - `--no-speech-threshold FLOAT`
+- `--eos-timestamp-margin FLOAT`
+- `--skip-final-tail-s FLOAT`
+- `--timestamp-eos-margin-s FLOAT`
 - `--show-model-info`
 - `--show-system-info`
 - `--show-perf` / `--show-timings`
@@ -160,6 +163,9 @@ Notes:
 - For `--task translate`, the CLI ignores `--language` and lets the runtime detect the source language.
 - `--show-model-info`, `--show-system-info`, `--show-perf`, and `--show-decode-debug` print diagnostic lines to stderr so stdout can still be redirected or written with `--out`.
 - `--show-decode-debug` is useful when a decode window stops on `max_new_tokens`, `silence`, or a fallback path and you want to inspect the exact stop reason.
+- `--eos-timestamp-margin` delays EOS on the final timestamped window until the latest timestamp gets close to the chunk end.
+- `--skip-final-tail-s` skips a tiny final tail window when the remaining audio after the current advance is smaller than the configured number of seconds and the window already ended with EOS/beam completion.
+- `--timestamp-eos-margin-s` suppresses EOS on partial final timestamped windows until segment-closing timestamps reach near the window end. Set `0` to disable it.
 - Audio decoding is done with `soundfile`. Only formats supported by `soundfile` / `libsndfile` are expected to work.
 
 ## Start the REST server
@@ -214,6 +220,7 @@ The server intentionally supports a small subset of the OpenAI Audio API:
 - `compression_ratio_threshold`
 - `logprob_threshold`
 - `no_speech_threshold`
+- `timestamp_eos_margin_s`
 - `timestamp_granularities[]=segment` only on `/v1/audio/transcriptions` with `response_format=verbose_json`
 
 ### Unsupported request fields
