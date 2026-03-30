@@ -6,7 +6,7 @@ set -e
 
 source_dir="tvm"
 branch="main"
-build_options="-G Ninja; -DCMAKE_BUILD_TYPE=RelWithDebInfo; -DUSE_MLIR=ON; -DUSE_CPP_RPC=ON;"
+build_options="-G Ninja; -DCMAKE_BUILD_TYPE=RelWithDebInfo;"
 use_llvm="ON"
 clean_build_dir=0
 if command -v uv &> /dev/null; then
@@ -23,6 +23,7 @@ while test $# -gt 0; do
       echo "--source-dir     source directory (default: tvm)"
       echo "--clean          cleanup build directory"
       echo "--cuda           enable CUDA support"
+      echo "--flashinfer     enable FlashInfer support"
       echo "--llvm           option for USE_LLVM"
       echo "--opencl         enable for USE_OPENCL"
       echo "--clml           enable for USE_CLML"
@@ -39,7 +40,11 @@ while test $# -gt 0; do
       ;;
     --cuda)
       shift
-      build_options+="-DUSE_CUDA=ON; -DUSE_TENSORRT_CODEGEN=ON;"
+      build_options+=" -DUSE_CUDA=ON; -DUSE_TENSORRT_CODEGEN=ON; -DUSE_CUBLAS=ON;"
+      ;;
+    --flashinfer)
+      shift
+      build_options+=" -DUSE_FLASHINFER=ON;"
       ;;
     --llvm)
       shift
@@ -48,11 +53,11 @@ while test $# -gt 0; do
       ;;
     --opencl)
       shift
-      build_options+="-DUSE_OPENCL=ON;"
+      build_options+=" -DUSE_OPENCL=ON;"
       ;;
     --clml)
       shift
-      build_options+="-DUSE_CLML=ON;"
+      build_options+=" -DUSE_CLML=ON;"
       ;;
     *)
       break
@@ -61,7 +66,7 @@ while test $# -gt 0; do
 done
 
 # llvm config
-build_options+="-DUSE_LLVM=$use_llvm;"
+build_options+=" -DUSE_LLVM=$use_llvm;"
 
 # clone repo or pull
 if [ -d "$source_dir" ]; then
