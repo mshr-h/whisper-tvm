@@ -359,6 +359,9 @@ class WhisperBundleRunner:
         )
         self.max_past_len = int(self.meta["max_dec_len_compiled"]) - 1
         self.max_decode_batch = int(self.meta.get("max_decode_batch", 1))
+        self.max_prompt_prefill_len = int(
+            self.meta.get("max_prompt_prefill_len", 0) or 0
+        )
         self.self_shape = (
             int(self.meta["decoder_layers"]),
             self.max_decode_batch,
@@ -715,6 +718,55 @@ class WhisperBundleRunner:
         self_v = to_tvm(np.zeros(self.self_shape, dtype=self.cache_np_dtype), self.dev)
         return self_k, self_v
 
+    def _pack_prefill_prompt(self, prompt_ids: Sequence[int]):
+        prompt_len = len(prompt_ids)
+        if prompt_len <= 0:
+            raise ValueError("prompt_ids must be non-empty")
+        if self.max_prompt_prefill_len <= 0:
+            raise ValueError("This bundle does not support decode_prefill")
+        if prompt_len > self.max_prompt_prefill_len:
+            raise ValueError(
+                f"prompt length {prompt_len} exceeds compiled max_prompt_prefill_len={self.max_prompt_prefill_len}"
+            )
+        token_pad = np.full(
+            (1, self.max_prompt_prefill_len),
+            int(self.eos),
+            dtype=np.int32,
+        )
+        position_pad = np.zeros((1, self.max_prompt_prefill_len), dtype=np.int32)
+        token_pad[0, :prompt_len] = np.asarray(prompt_ids, dtype=np.int32)
+        position_pad[0, :prompt_len] = np.arange(prompt_len, dtype=np.int32)
+        return token_pad, position_pad, prompt_len
+
+    def _prefill_to_self_cache(
+        self,
+        prefill_k,
+        prefill_v,
+        prompt_len: int,
+        active_count: int,
+    ):
+        if active_count <= 0:
+            raise ValueError("active_count must be positive")
+        keep = max(0, min(int(prompt_len), self.max_past_len))
+        self_k = np.zeros(self.self_shape, dtype=self.cache_np_dtype)
+        self_v = np.zeros(self.self_shape, dtype=self.cache_np_dtype)
+        if keep > 0:
+            prefill_k_np = np.asarray(
+                unwrap(prefill_k).numpy(), dtype=self.cache_np_dtype
+            )
+            prefill_v_np = np.asarray(
+                unwrap(prefill_v).numpy(), dtype=self.cache_np_dtype
+            )
+            tail_k = prefill_k_np[:, 0:1, :, prompt_len - keep : prompt_len, :]
+            tail_v = prefill_v_np[:, 0:1, :, prompt_len - keep : prompt_len, :]
+            self_k[:, :active_count, :, -keep:, :] = np.repeat(
+                tail_k, active_count, axis=1
+            )
+            self_v[:, :active_count, :, -keep:, :] = np.repeat(
+                tail_v, active_count, axis=1
+            )
+        return to_tvm(self_k, self.dev), to_tvm(self_v, self.dev)
+
     def _make_past_keep_mask(
         self, positions: Sequence[int], active_count: int
     ) -> np.ndarray:
@@ -824,7 +876,30 @@ class WhisperBundleRunner:
         if active_count <= 0:
             raise ValueError("active_count must be positive")
 
-        def _run_prompt():
+        def _run_prompt_prefill():
+            token_pad, position_pad, prompt_len = self._pack_prefill_prompt(prompt_ids)
+            logits, prefill_k, prefill_v = unwrap_many(
+                self.vm["decode_prefill"](
+                    to_tvm(token_pad, self.dev),
+                    to_tvm(position_pad, self.dev),
+                    cross_k,
+                    cross_v,
+                    self.params,
+                )
+            )
+            logits_np = np.asarray(unwrap(logits).numpy(), dtype=np.float32)
+            last_logits = np.repeat(
+                logits_np[:, prompt_len - 1, :], active_count, axis=0
+            )
+            self_k, self_v = self._prefill_to_self_cache(
+                prefill_k,
+                prefill_v,
+                prompt_len,
+                active_count,
+            )
+            return last_logits, self_k, self_v, prompt_len
+
+        def _run_prompt_stepwise():
             self_k, self_v = self._zero_self_cache()
             logits = None
             for pos, token_id in enumerate(prompt_ids):
@@ -842,7 +917,12 @@ class WhisperBundleRunner:
                 raise RuntimeError("Failed to prime decoder.")
             return logits, self_k, self_v, len(prompt_ids)
 
-        result, elapsed_ms = self._time_call(_run_prompt)
+        use_prefill = (
+            self.max_prompt_prefill_len > 0
+            and 1 < len(prompt_ids) <= self.max_prompt_prefill_len
+        )
+        runner = _run_prompt_prefill if use_prefill else _run_prompt_stepwise
+        result, elapsed_ms = self._time_call(runner)
         self._record_metric(metric_name, elapsed_ms)
         return result
 
@@ -1260,15 +1340,30 @@ class WhisperBundleRunner:
             )
             if finished_candidates:
                 finished.extend(finished_candidates)
-                if len(finished) >= beam_size:
-                    stop_reason = "beam_finished"
-                    active = []
-                    break
+            if finished:
+                finished.sort(
+                    key=lambda h: self._rank_score(
+                        h.sum_logprob, len(h.tokens), length_penalty
+                    ),
+                    reverse=True,
+                )
+                finished = finished[:beam_size]
             if not active_candidates:
                 stop_reason = "eos" if eos_seen else "all_logits_filtered"
                 active = []
                 break
             active_candidates.sort(key=lambda x: x[0], reverse=True)
+            if length_penalty is None and len(finished) >= beam_size:
+                worst_finished_score = self._rank_score(
+                    finished[-1].sum_logprob,
+                    len(finished[-1].tokens),
+                    length_penalty,
+                )
+                best_active_score = float(active_candidates[0][0])
+                if worst_finished_score >= best_active_score:
+                    stop_reason = "beam_finished"
+                    active = []
+                    break
             survivors = active_candidates[:beam_size]
             parent_indices = [cand[1] for cand in survivors]
             next_tokens = [cand[2] for cand in survivors]
