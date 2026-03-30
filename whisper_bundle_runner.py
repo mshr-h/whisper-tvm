@@ -1,6 +1,9 @@
 import io
 import json
 import math
+import os
+import platform
+import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +47,37 @@ class DecodeAttempt:
     no_speech_prob: float
     temperature: float
     strategy: str
+
+
+@dataclass
+class PerfMetric:
+    total_ms: float = 0.0
+    runs: int = 0
+
+    def add(self, elapsed_ms: float, runs: int = 1):
+        self.total_ms += float(elapsed_ms)
+        self.runs += int(runs)
+
+    @property
+    def avg_ms(self) -> float:
+        return self.total_ms / self.runs if self.runs > 0 else 0.0
+
+
+@dataclass
+class BundlePerfStats:
+    load_ms: float = 0.0
+    total_ms: float = 0.0
+    mel: PerfMetric = field(default_factory=PerfMetric)
+    encode: PerfMetric = field(default_factory=PerfMetric)
+    cross_kv: PerfMetric = field(default_factory=PerfMetric)
+    prompt: PerfMetric = field(default_factory=PerfMetric)
+    lang_detect: PerfMetric = field(default_factory=PerfMetric)
+    sample: PerfMetric = field(default_factory=PerfMetric)
+    decode: PerfMetric = field(default_factory=PerfMetric)
+    batchd: PerfMetric = field(default_factory=PerfMetric)
+    fallbacks_compression_ratio: int = 0
+    fallbacks_logprob: int = 0
+    silence_skips: int = 0
 
 
 def choose_device(name: str = "auto"):
@@ -186,6 +220,14 @@ def _format_bytes(size: int | None) -> str:
     return f"{int(size)} B"
 
 
+def _default_thread_count() -> int:
+    for name in ("WHISPER_N_THREADS", "OMP_NUM_THREADS", "TVM_NUM_THREADS"):
+        value = os.getenv(name)
+        if value and value.isdigit() and int(value) > 0:
+            return int(value)
+    return max(1, int(os.cpu_count() or 1))
+
+
 class WhisperBundleRunner:
     def __init__(
         self,
@@ -193,11 +235,17 @@ class WhisperBundleRunner:
         tokenizer_json: str | Path | None = None,
         device: str = "auto",
     ):
+        init_started = time.perf_counter()
         artifacts_dir = Path(artifacts_dir)
         tokenizer_json = Path(tokenizer_json or artifacts_dir / "tokenizer.json")
         self.meta = json.loads(
             (artifacts_dir / "whisper_bundle_metadata.json").read_text(encoding="utf-8")
         )
+        self.requested_device = str(device)
+        self.device_kind = (
+            "cpu" if self.requested_device == "cpu" or not tvm.cuda(0).exist else "cuda"
+        )
+        self.device_id = 0
         self.dev = choose_device(device)
         self.vm = relax.VirtualMachine(
             tvm.runtime.load_module(str(artifacts_dir / self.meta["lib_name"])),
@@ -265,10 +313,154 @@ class WhisperBundleRunner:
             self.max_past_len,
             int(self.meta["head_dim"]),
         )
+        self.load_time_ms = (time.perf_counter() - init_started) * 1000.0
+        self.last_perf: BundlePerfStats | None = None
+        self.collect_perf = False
+
+    def _reset_perf(self, enabled: bool = False):
+        self.collect_perf = bool(enabled)
+        self.last_perf = (
+            BundlePerfStats(load_ms=float(self.load_time_ms))
+            if self.collect_perf
+            else None
+        )
+        return self.last_perf
+
+    def _ensure_perf(self) -> BundlePerfStats:
+        if self.last_perf is None:
+            raise RuntimeError("Performance collection is not enabled.")
+        return self.last_perf
+
+    def _sync_device(self):
+        sync = getattr(self.dev, "sync", None)
+        if callable(sync):
+            sync()
+
+    def _time_call(self, fn):
+        if self.last_perf is None:
+            return fn(), 0.0
+        self._sync_device()
+        started = time.perf_counter()
+        out = fn()
+        self._sync_device()
+        return out, (time.perf_counter() - started) * 1000.0
+
+    def _record_metric(self, name: str, elapsed_ms: float, runs: int = 1):
+        if self.last_perf is None:
+            return
+        metric = getattr(self.last_perf, name)
+        metric.add(elapsed_ms, runs=runs)
+
+    def _cpu_capability(self) -> str | None:
+        try:
+            import torch
+
+            backend = getattr(getattr(torch, "backends", None), "cpu", None)
+            getter = getattr(backend, "get_cpu_capability", None)
+            if callable(getter):
+                value = getter()
+                return str(value) if value is not None else None
+        except Exception:
+            return None
+        return None
+
+    def _gpu_system_info_parts(self) -> list[str]:
+        if self.device_kind != "cuda":
+            return ["CUDA = 0"]
+        parts = ["CUDA = 1"]
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return parts
+            props = torch.cuda.get_device_properties(self.device_id)
+            cap = torch.cuda.get_device_capability(self.device_id)
+            parts.extend(
+                [
+                    f"GPU = {props.name}",
+                    f"CC = {cap[0]}.{cap[1]}",
+                    f"VRAM = {int(props.total_memory // (1024 * 1024))} MiB",
+                ]
+            )
+            return parts
+        except Exception:
+            return parts
+
+    def whisper_cpp_system_info_lines(self) -> list[str]:
+        active_threads = _default_thread_count()
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        thread_part = (
+            f"{active_threads} / {cpu_count}"
+            if active_threads != cpu_count
+            else f"{active_threads}"
+        )
+        parts = [
+            f"system_info: n_threads = {thread_part}",
+            "BACKEND = TVM_RELAX_VM",
+            f"device = {self.device_kind}:{self.device_id}",
+        ]
+        parts.extend(self._gpu_system_info_parts())
+        cpu_cap = self._cpu_capability()
+        if cpu_cap:
+            parts.append(f"CPU_CAP = {cpu_cap}")
+        parts.append(f"CPU = {platform.machine() or 'unknown'}")
+        return [" | ".join(parts)]
+
+    def _format_total_only_perf_line(self, label: str, total_ms: float) -> str:
+        return f"whisper_print_timings: {label:<11} = {total_ms:8.2f} ms"
+
+    def _format_perf_line(
+        self,
+        label: str,
+        metric: PerfMetric,
+        unit_label: str = "runs",
+    ) -> str:
+        unit_singular = unit_label[:-1] if unit_label.endswith("s") else unit_label
+        return (
+            f"whisper_print_timings: {label:<11} = {metric.total_ms:8.2f} ms / "
+            f"{metric.runs} {unit_label} ({metric.avg_ms:6.2f} ms per {unit_singular})"
+        )
+
+    def whisper_cpp_timing_lines(self) -> list[str]:
+        perf = self.last_perf
+        if perf is None:
+            return []
+        encode_total = PerfMetric(
+            total_ms=perf.encode.total_ms + perf.cross_kv.total_ms,
+            runs=max(perf.encode.runs, perf.cross_kv.runs),
+        )
+        lines = [
+            self._format_total_only_perf_line("load time", perf.load_ms),
+            (
+                "whisper_print_timings: fallbacks   = "
+                f"{perf.fallbacks_compression_ratio} cr / {perf.fallbacks_logprob} lp"
+            ),
+            self._format_total_only_perf_line("mel time", perf.mel.total_ms),
+            self._format_perf_line("sample time", perf.sample, unit_label="decisions"),
+            self._format_perf_line("encode time", encode_total),
+            self._format_perf_line("decode time", perf.decode),
+            self._format_perf_line("batchd time", perf.batchd),
+            self._format_perf_line("prompt time", perf.prompt),
+            self._format_total_only_perf_line("total time", perf.total_ms),
+        ]
+        if perf.lang_detect.runs > 0:
+            lines.insert(7, self._format_perf_line("lang detect", perf.lang_detect))
+        if perf.silence_skips:
+            lines.append(f"whisper_print_timings: silence skips = {perf.silence_skips}")
+        return lines
 
     def whisper_cpp_model_lines(self) -> list[str]:
         model_size = int(self.meta.get("model_size_bytes", 0) or 0)
+        params_size = int(self.meta.get("params_size_bytes", 0) or 0)
+        lib_size = int(self.meta.get("lib_size_bytes", 0) or 0)
+        tokenizer_size = int(self.meta.get("tokenizer_size_bytes", 0) or 0)
+        bundle_size = int(self.meta.get("bundle_size_bytes", 0) or 0)
+        model_id = str(self.meta.get("model_id", "unknown"))
+        model_type = model_id.rsplit("/", 1)[-1]
+        if model_type.startswith("whisper-"):
+            model_type = model_type[len("whisper-") :]
         return [
+            f"whisper_model_load: model_id      = {model_id}",
             f"whisper_model_load: n_vocab       = {int(self.meta['vocab_size'])}",
             f"whisper_model_load: n_audio_ctx   = {int(self.meta.get('n_audio_ctx', self.meta['max_source_positions']))}",
             f"whisper_model_load: n_audio_state = {int(self.meta.get('n_audio_state', self.meta.get('d_model', 0)))}",
@@ -279,9 +471,15 @@ class WhisperBundleRunner:
             f"whisper_model_load: n_text_head   = {int(self.meta.get('n_text_head', self.meta.get('decoder_attention_heads', 0)))}",
             f"whisper_model_load: n_text_layer  = {int(self.meta.get('n_text_layer', self.meta.get('decoder_layers', 0)))}",
             f"whisper_model_load: n_mels        = {int(self.meta.get('n_mels', self.meta.get('num_mel_bins', 0)))}",
+            f"whisper_model_load: type          = {model_type or 'unknown'}",
             f"whisper_model_load: ftype         = {self.meta.get('ftype', 'unknown')}",
             f"whisper_model_load: qntvr         = {int(self.meta.get('qntvr', 0))}",
+            f"whisper_model_load: n_langs       = {len(self.meta.get('language_token_ids', {}))}",
             f"whisper_model_load: model size    = {_format_bytes(model_size)}",
+            f"whisper_model_load: lib size      = {_format_bytes(lib_size)}",
+            f"whisper_model_load: params size   = {_format_bytes(params_size)}",
+            f"whisper_model_load: tokenizer size= {_format_bytes(tokenizer_size)}",
+            f"whisper_model_load: bundle size   = {_format_bytes(bundle_size)}",
         ]
 
     def decode_text(self, ids: Sequence[int]) -> str:
@@ -343,10 +541,22 @@ class WhisperBundleRunner:
 
     def load_window(self, audio: np.ndarray, start: int):
         wave, valid = self._slice_window(audio, start)
-        pp = self.vm["preprocess"](to_tvm(wave, self.dev), to_tvm(valid, self.dev))
+        pp, elapsed_ms = self._time_call(
+            lambda: self.vm["preprocess"](
+                to_tvm(wave, self.dev), to_tvm(valid, self.dev)
+            )
+        )
+        self._record_metric("mel", elapsed_ms)
         feats, _ = unwrap_many(pp)
-        enc = unwrap(self.vm["encode"](feats, self.params))
-        cross_k, cross_v = unwrap_many(self.vm["cross_kv"](enc, self.params))
+        enc, elapsed_ms = self._time_call(
+            lambda: unwrap(self.vm["encode"](feats, self.params))
+        )
+        self._record_metric("encode", elapsed_ms)
+        cross, elapsed_ms = self._time_call(
+            lambda: self.vm["cross_kv"](enc, self.params)
+        )
+        self._record_metric("cross_kv", elapsed_ms)
+        cross_k, cross_v = unwrap_many(cross)
         return unwrap(cross_k), unwrap(cross_v), int(valid[0])
 
     def _zero_self_cache(self):
@@ -376,6 +586,8 @@ class WhisperBundleRunner:
         self_v,
         cross_k,
         cross_v,
+        *,
+        record_perf: bool = True,
     ):
         active_count = len(token_ids)
         if active_count <= 0:
@@ -389,16 +601,20 @@ class WhisperBundleRunner:
         token_pad[:active_count, 0] = np.asarray(token_ids, dtype=np.int32)
         position_pad[:active_count, 0] = np.asarray(positions, dtype=np.int32)
         mask = self._make_past_keep_mask(positions, active_count)
-        out = self.vm["decode_step"](
-            to_tvm(token_pad, self.dev),
-            to_tvm(position_pad, self.dev),
-            self_k,
-            self_v,
-            to_tvm(mask, self.dev),
-            cross_k,
-            cross_v,
-            self.params,
+        out, elapsed_ms = self._time_call(
+            lambda: self.vm["decode_step"](
+                to_tvm(token_pad, self.dev),
+                to_tvm(position_pad, self.dev),
+                self_k,
+                self_v,
+                to_tvm(mask, self.dev),
+                cross_k,
+                cross_v,
+                self.params,
+            )
         )
+        if record_perf:
+            self._record_metric("decode" if active_count == 1 else "batchd", elapsed_ms)
         logits, next_k, next_v = unwrap_many(out)
         return (
             np.asarray(unwrap(logits).numpy(), dtype=np.float32)[:active_count],
@@ -425,24 +641,37 @@ class WhisperBundleRunner:
         return unwrap(next_k), unwrap(next_v)
 
     def _prime_batch(
-        self, prompt_ids: Sequence[int], cross_k, cross_v, active_count: int
+        self,
+        prompt_ids: Sequence[int],
+        cross_k,
+        cross_v,
+        active_count: int,
+        *,
+        metric_name: str = "prompt",
     ):
         if active_count <= 0:
             raise ValueError("active_count must be positive")
-        self_k, self_v = self._zero_self_cache()
-        logits = None
-        for pos, token_id in enumerate(prompt_ids):
-            logits, self_k, self_v = self._decode_step_batch(
-                [int(token_id)] * active_count,
-                [pos] * active_count,
-                self_k,
-                self_v,
-                cross_k,
-                cross_v,
-            )
-        if logits is None:
-            raise RuntimeError("Failed to prime decoder.")
-        return logits, self_k, self_v, len(prompt_ids)
+
+        def _run_prompt():
+            self_k, self_v = self._zero_self_cache()
+            logits = None
+            for pos, token_id in enumerate(prompt_ids):
+                logits, self_k, self_v = self._decode_step_batch(
+                    [int(token_id)] * active_count,
+                    [pos] * active_count,
+                    self_k,
+                    self_v,
+                    cross_k,
+                    cross_v,
+                    record_perf=False,
+                )
+            if logits is None:
+                raise RuntimeError("Failed to prime decoder.")
+            return logits, self_k, self_v, len(prompt_ids)
+
+        result, elapsed_ms = self._time_call(_run_prompt)
+        self._record_metric(metric_name, elapsed_ms)
+        return result
 
     def detect_language(self, cross_k, cross_v) -> str:
         if not bool(self.meta.get("is_multilingual", False)):
@@ -457,6 +686,7 @@ class WhisperBundleRunner:
             cross_k,
             cross_v,
             1,
+            metric_name="lang_detect",
         )
         cand = np.asarray(sorted(lang_ids.values()), dtype=np.int64)
         return {v: k for k, v in lang_ids.items()}.get(
@@ -698,12 +928,15 @@ class WhisperBundleRunner:
             next_tokens: list[int] = []
             positions: list[int] = []
             next_active: list[DecodeHypothesis] = []
+            sample_started = time.perf_counter()
+            decisions = 0
             for parent_idx, hyp in enumerate(active):
                 scores = self.filter_logits(hyp.next_logits, hyp.tokens, timestamps)
                 if np.all(np.isneginf(scores)):
                     finished.append(hyp)
                     continue
                 next_id, token_logprob = self._pick_next_token(scores, temperature)
+                decisions += 1
                 child = DecodeHypothesis(
                     tokens=[*hyp.tokens, int(next_id)],
                     sum_logprob=float(hyp.sum_logprob + token_logprob),
@@ -717,6 +950,11 @@ class WhisperBundleRunner:
                 next_tokens.append(int(next_id))
                 positions.append(int(hyp.position))
                 next_active.append(child)
+            self._record_metric(
+                "sample",
+                (time.perf_counter() - sample_started) * 1000.0,
+                runs=decisions,
+            )
             if not next_tokens:
                 active = []
                 break
@@ -774,13 +1012,17 @@ class WhisperBundleRunner:
             finished_candidates: list[DecodeHypothesis] = []
             active_candidates: list[tuple[float, int, int, int, DecodeHypothesis]] = []
             per_hyp_topk = max(beam_size + 1, 2)
+            sample_started = time.perf_counter()
+            decisions = 0
             for parent_idx, hyp in enumerate(active):
                 scores = self.filter_logits(hyp.next_logits, hyp.tokens, timestamps)
                 if np.all(np.isneginf(scores)):
                     finished.append(hyp)
                     continue
                 logprobs = _log_softmax(scores)
-                for next_id in self._top_indices(logprobs, per_hyp_topk).tolist():
+                top_indices = self._top_indices(logprobs, per_hyp_topk).tolist()
+                decisions += 1
+                for next_id in top_indices:
                     token_logprob = float(logprobs[int(next_id)])
                     if not np.isfinite(token_logprob):
                         continue
@@ -806,6 +1048,11 @@ class WhisperBundleRunner:
                                 child,
                             )
                         )
+            self._record_metric(
+                "sample",
+                (time.perf_counter() - sample_started) * 1000.0,
+                runs=decisions,
+            )
             if finished_candidates:
                 finished.extend(finished_candidates)
             if not active_candidates:
@@ -888,17 +1135,21 @@ class WhisperBundleRunner:
             return len(attempt.tokens) == 0
         return attempt.avg_logprob < float(cfg.logprob_threshold)
 
-    def _should_fallback(self, attempt: DecodeAttempt, cfg: DecodeConfig) -> bool:
-        if (
+    def _fallback_reasons(
+        self, attempt: DecodeAttempt, cfg: DecodeConfig
+    ) -> tuple[bool, bool]:
+        compression_ratio = bool(
             cfg.compression_ratio_threshold is not None
             and attempt.compression_ratio > float(cfg.compression_ratio_threshold)
-        ):
-            return True
-        if cfg.logprob_threshold is not None and attempt.avg_logprob < float(
-            cfg.logprob_threshold
-        ):
-            return True
-        return False
+        )
+        logprob = bool(
+            cfg.logprob_threshold is not None
+            and attempt.avg_logprob < float(cfg.logprob_threshold)
+        )
+        return compression_ratio, logprob
+
+    def _should_fallback(self, attempt: DecodeAttempt, cfg: DecodeConfig) -> bool:
+        return any(self._fallback_reasons(attempt, cfg))
 
     def decode_window(
         self,
@@ -923,8 +1174,14 @@ class WhisperBundleRunner:
             )
             last_attempt = attempt
             if self._should_skip_silence(attempt, cfg):
+                if self.last_perf is not None:
+                    self.last_perf.silence_skips += 1
                 return []
-            if temperature != temperatures[-1] and self._should_fallback(attempt, cfg):
+            compression_ratio, logprob = self._fallback_reasons(attempt, cfg)
+            if temperature != temperatures[-1] and (compression_ratio or logprob):
+                if self.last_perf is not None:
+                    self.last_perf.fallbacks_compression_ratio += int(compression_ratio)
+                    self.last_perf.fallbacks_logprob += int(logprob)
                 continue
             return attempt.tokens
         return [] if last_attempt is None else list(last_attempt.tokens)
@@ -1029,67 +1286,74 @@ class WhisperBundleRunner:
         compression_ratio_threshold: float | None = 2.4,
         logprob_threshold: float | None = -1.0,
         no_speech_threshold: float | None = 0.6,
+        collect_perf: bool = False,
     ):
-        cfg = self._normalize_decode_config(
-            temperature=temperature,
-            temperature_inc=temperature_inc,
-            beam_size=beam_size,
-            best_of=best_of,
-            length_penalty=length_penalty,
-            compression_ratio_threshold=compression_ratio_threshold,
-            logprob_threshold=logprob_threshold,
-            no_speech_threshold=no_speech_threshold,
-        )
-        sr, seek, history, segments, detected = (
-            int(self.meta["sample_rate"]),
-            0,
-            [],
-            [],
-            language,
-        )
-        while seek < len(audio) or (len(audio) == 0 and not segments):
-            cross_k, cross_v, valid = self.load_window(audio, seek)
-            if valid <= 0 and len(audio) > 0:
-                break
-            if detected is None:
-                detected = self.detect_language(cross_k, cross_v)
-            prompt = self.build_prompt(
-                detected,
-                task,
-                timestamps,
-                history if condition_on_previous_text else [],
+        self._reset_perf(collect_perf)
+        run_started = time.perf_counter()
+        try:
+            cfg = self._normalize_decode_config(
+                temperature=temperature,
+                temperature_inc=temperature_inc,
+                beam_size=beam_size,
+                best_of=best_of,
+                length_penalty=length_penalty,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
+                no_speech_threshold=no_speech_threshold,
             )
-            ids = self.decode_window(
-                cross_k,
-                cross_v,
-                prompt,
-                self.max_new_tokens(max_new_tokens, len(prompt)),
-                timestamps,
-                cfg,
+            sr, seek, history, segments, detected = (
+                int(self.meta["sample_rate"]),
+                0,
+                [],
+                [],
+                language,
             )
-            window_segments, advance = self.build_segments(
-                ids, seek / float(sr), valid, timestamps
-            )
-            for s in window_segments:
-                s["id"] = len(segments)
-                segments.append(s)
-                if condition_on_previous_text:
-                    history.extend(int(x) for x in s["tokens"])
-            seek += int(
-                (advance if timestamps else valid)
-                or min(valid, int(self.meta["samples_per_timestamp"]))
-            )
-            if len(audio) == 0:
-                break
-        detected = detected or str(self.meta.get("default_language_code", "en"))
-        return {
-            "text": "".join(str(s["text"]) for s in segments).strip(),
-            "language": detected,
-            "language_name": self.meta.get("language_code_to_name", {}).get(
-                detected, detected
-            ),
-            "task": task,
-            "timestamps": bool(timestamps),
-            "duration": float(len(audio) / float(sr)),
-            "segments": segments,
-        }
+            while seek < len(audio) or (len(audio) == 0 and not segments):
+                cross_k, cross_v, valid = self.load_window(audio, seek)
+                if valid <= 0 and len(audio) > 0:
+                    break
+                if detected is None:
+                    detected = self.detect_language(cross_k, cross_v)
+                prompt = self.build_prompt(
+                    detected,
+                    task,
+                    timestamps,
+                    history if condition_on_previous_text else [],
+                )
+                ids = self.decode_window(
+                    cross_k,
+                    cross_v,
+                    prompt,
+                    self.max_new_tokens(max_new_tokens, len(prompt)),
+                    timestamps,
+                    cfg,
+                )
+                window_segments, advance = self.build_segments(
+                    ids, seek / float(sr), valid, timestamps
+                )
+                for s in window_segments:
+                    s["id"] = len(segments)
+                    segments.append(s)
+                    if condition_on_previous_text:
+                        history.extend(int(x) for x in s["tokens"])
+                seek += int(
+                    (advance if timestamps else valid)
+                    or min(valid, int(self.meta["samples_per_timestamp"]))
+                )
+                if len(audio) == 0:
+                    break
+            detected = detected or str(self.meta.get("default_language_code", "en"))
+            return {
+                "text": "".join(str(s["text"]) for s in segments).strip(),
+                "language": detected,
+                "language_name": self.meta.get("language_code_to_name", {}).get(
+                    detected, detected
+                ),
+                "task": task,
+                "timestamps": bool(timestamps),
+                "duration": float(len(audio) / float(sr)),
+                "segments": segments,
+            }
+        finally:
+            if self.last_perf is not None:
+                self.last_perf.total_ms = (time.perf_counter() - run_started) * 1000.0

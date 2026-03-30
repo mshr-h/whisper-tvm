@@ -90,6 +90,17 @@ python run_whisper_bundle.py \
   --response-format verbose_json
 ```
 
+whisper.cpp-style stderr logging:
+
+```bash
+python run_whisper_bundle.py \
+  --artifacts-dir ./artifacts/whisper-tiny \
+  --audio ./jfk.flac \
+  --show-model-info \
+  --show-system-info \
+  --show-perf
+```
+
 Useful options:
 
 - `--device auto|cpu|cuda`
@@ -107,6 +118,8 @@ Useful options:
 - `--logprob-threshold FLOAT`
 - `--no-speech-threshold FLOAT`
 - `--show-model-info`
+- `--show-system-info`
+- `--show-perf` / `--show-timings`
 - `--no-prev-text`
 - `--out PATH`
 
@@ -114,6 +127,7 @@ Notes:
 
 - `verbose_json`, `srt`, and `vtt` automatically enable timestamps.
 - For `--task translate`, the CLI ignores `--language` and lets the runtime detect the source language.
+- `--show-model-info`, `--show-system-info`, and `--show-perf` print whisper.cpp-style diagnostic lines to stderr so stdout can still be redirected or written with `--out`.
 - Audio decoding is done with `soundfile`. Only formats supported by `soundfile` / `libsndfile` are expected to work.
 
 ## Start the REST server

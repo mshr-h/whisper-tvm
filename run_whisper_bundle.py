@@ -12,6 +12,26 @@ from whisper_bundle_runner import (
     resolve_task,
 )
 
+
+def _processing_line(
+    audio_path: Path,
+    sample_rate: int,
+    num_samples: int,
+    language: str | None,
+    task: str,
+    timestamps: bool,
+    beam_size: int,
+    best_of: int,
+) -> str:
+    return (
+        f"main: processing '{audio_path}' ({num_samples} samples, "
+        f"{num_samples / float(sample_rate):.1f} sec), "
+        f"beam_size = {beam_size}, best_of = {best_of}, "
+        f"lang = {language or 'auto'}, task = {task}, "
+        f"timestamps = {1 if timestamps else 0} ..."
+    )
+
+
 p = argparse.ArgumentParser(description="Run a Whisper TVM bundle.")
 p.add_argument("--artifacts-dir", type=Path, required=True)
 p.add_argument("--audio", type=Path, required=True)
@@ -35,6 +55,8 @@ p.add_argument("--compression-ratio-threshold", type=float, default=2.4)
 p.add_argument("--logprob-threshold", type=float, default=-1.0)
 p.add_argument("--no-speech-threshold", type=float, default=0.6)
 p.add_argument("--show-model-info", action="store_true")
+p.add_argument("--show-system-info", action="store_true")
+p.add_argument("--show-perf", "--show-timings", action="store_true")
 p.add_argument("--no-prev-text", action="store_true")
 p.add_argument("--out", type=Path)
 args = p.parse_args()
@@ -43,14 +65,40 @@ runner = WhisperBundleRunner(args.artifacts_dir, args.tokenizer_json, args.devic
 if args.show_model_info:
     for line in runner.whisper_cpp_model_lines():
         print(line, file=sys.stderr)
+if args.show_system_info or args.show_perf:
+    for line in runner.whisper_cpp_system_info_lines():
+        print(line, file=sys.stderr)
+
 fmt = args.response_format.lower()
+sample_rate = int(runner.meta["sample_rate"])
+audio = load_audio(args.audio, sample_rate)
+resolved_task = resolve_task(args.task, runner.meta)
+resolved_language = resolve_language(
+    args.language if resolved_task != "translate" else None,
+    runner.meta,
+)
+use_timestamps = args.timestamps or fmt in {"verbose_json", "srt", "vtt"}
+
+if args.show_perf:
+    print(
+        _processing_line(
+            args.audio,
+            sample_rate,
+            int(audio.shape[0]),
+            resolved_language,
+            resolved_task,
+            use_timestamps,
+            args.beam_size,
+            args.best_of,
+        ),
+        file=sys.stderr,
+    )
+
 result = runner.run(
-    audio=load_audio(args.audio, int(runner.meta["sample_rate"])),
-    language=resolve_language(
-        args.language if args.task != "translate" else None, runner.meta
-    ),
-    task=resolve_task(args.task, runner.meta),
-    timestamps=args.timestamps or fmt in {"verbose_json", "srt", "vtt"},
+    audio=audio,
+    language=resolved_language,
+    task=resolved_task,
+    timestamps=use_timestamps,
     max_new_tokens=args.max_new_tokens,
     condition_on_previous_text=not args.no_prev_text,
     temperature=args.temperature,
@@ -61,7 +109,13 @@ result = runner.run(
     compression_ratio_threshold=args.compression_ratio_threshold,
     logprob_threshold=args.logprob_threshold,
     no_speech_threshold=args.no_speech_threshold,
+    collect_perf=args.show_perf,
 )
+
+if args.show_perf:
+    for line in runner.whisper_cpp_timing_lines():
+        print(line, file=sys.stderr)
+
 out = render_result(result, fmt)
 out = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, indent=2)
 if args.out:
