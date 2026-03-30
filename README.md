@@ -73,6 +73,7 @@ Options:
 - `--output-dir`: directory for the compiled bundle.
 - `--target`: `cpu` or `cuda`.
 - `--max-new-tokens`: runtime default stored in metadata. The compiled decoder still uses `config.max_target_positions`.
+- `--max-decode-batch`: maximum runtime batch for decoder-side beam search / best-of. `beam_size` and `best_of` must be less than or equal to this value.
 
 ## Download sample audio
 
@@ -97,8 +98,17 @@ Useful options:
 - `--timestamps`
 - `--response-format json|text|verbose_json|srt|vtt`
 - `--max-new-tokens N`
+- `--temperature FLOAT`
+- `--temperature-inc FLOAT`
+- `--beam-size N`
+- `--best-of N`
+- `--length-penalty FLOAT`
+- `--compression-ratio-threshold FLOAT`
+- `--logprob-threshold FLOAT`
+- `--no-speech-threshold FLOAT`
+- `--show-model-info`
 - `--no-prev-text`
-- `--output PATH`
+- `--out PATH`
 
 Notes:
 
@@ -150,7 +160,14 @@ The server intentionally supports a small subset of the OpenAI Audio API:
 - `model`
 - `language` on `/v1/audio/transcriptions`
 - `response_format`: `json`, `text`, `verbose_json`, `srt`, `vtt`
-- `temperature`: only `0`
+- `temperature`
+- `temperature_inc`
+- `beam_size`
+- `best_of`
+- `length_penalty`
+- `compression_ratio_threshold`
+- `logprob_threshold`
+- `no_speech_threshold`
 - `timestamp_granularities[]=segment` only on `/v1/audio/transcriptions` with `response_format=verbose_json`
 
 ### Unsupported request fields
@@ -159,7 +176,6 @@ These are rejected with `400 invalid_request_error`:
 
 - `prompt`
 - `stream=true`
-- `temperature != 0`
 - word timestamps
 - diarization-related fields
 - any extra OpenAI Audio API fields not listed above

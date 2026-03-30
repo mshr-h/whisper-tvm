@@ -30,7 +30,20 @@ def make_app(args):
             form = await request.form()
         except Exception as e:
             return err(f"Failed to parse multipart/form-data: {e}")
-        allowed = {"file", "model", "response_format", "temperature", "stream"}
+        allowed = {
+            "file",
+            "model",
+            "response_format",
+            "temperature",
+            "temperature_inc",
+            "beam_size",
+            "best_of",
+            "length_penalty",
+            "compression_ratio_threshold",
+            "logprob_threshold",
+            "no_speech_threshold",
+            "stream",
+        }
         if task == "transcribe":
             allowed |= {
                 "language",
@@ -53,12 +66,38 @@ def make_app(args):
         fmt = str(form.get("response_format") or "json").lower()
         if fmt not in {"json", "text", "verbose_json", "srt", "vtt"}:
             return err(f"Unsupported response_format: {fmt}")
+
+        def parse_optional_float(name: str, default=None):
+            value = form.get(name)
+            if value in {None, ""}:
+                return default
+            try:
+                return float(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number.") from exc
+
+        def parse_optional_int(name: str, default=None):
+            value = form.get(name)
+            if value in {None, ""}:
+                return default
+            try:
+                return int(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer.") from exc
+
         try:
-            temperature = float(form.get("temperature") or 0)
-        except ValueError:
-            return err("temperature must be a number.")
-        if temperature != 0:
-            return err("Only temperature=0 is supported.")
+            temperature = parse_optional_float("temperature", 0.0)
+            temperature_inc = parse_optional_float("temperature_inc", 0.0)
+            beam_size = parse_optional_int("beam_size", 1)
+            best_of = parse_optional_int("best_of", 1)
+            length_penalty = parse_optional_float("length_penalty", None)
+            compression_ratio_threshold = parse_optional_float(
+                "compression_ratio_threshold", 2.4
+            )
+            logprob_threshold = parse_optional_float("logprob_threshold", -1.0)
+            no_speech_threshold = parse_optional_float("no_speech_threshold", 0.6)
+        except ValueError as e:
+            return err(str(e))
         if str(form.get("stream") or "false").lower() in {"1", "true", "yes", "on"}:
             return err("stream is not supported.")
         gran = form.getlist("timestamp_granularities[]") + form.getlist(
@@ -90,6 +129,14 @@ def make_app(args):
                     timestamps=fmt in {"verbose_json", "srt", "vtt"} or bool(gran),
                     max_new_tokens=None,
                     condition_on_previous_text=True,
+                    temperature=temperature,
+                    temperature_inc=temperature_inc,
+                    beam_size=beam_size,
+                    best_of=best_of,
+                    length_penalty=length_penalty,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    logprob_threshold=logprob_threshold,
+                    no_speech_threshold=no_speech_threshold,
                 )
         except ValueError as e:
             return err(str(e))

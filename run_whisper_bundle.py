@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from whisper_bundle_runner import (
@@ -25,11 +26,23 @@ p.add_argument(
     default="text",
 )
 p.add_argument("--max-new-tokens", type=int)
+p.add_argument("--temperature", type=float, default=0.0)
+p.add_argument("--temperature-inc", type=float, default=0.0)
+p.add_argument("--beam-size", type=int, default=1)
+p.add_argument("--best-of", type=int, default=1)
+p.add_argument("--length-penalty", type=float)
+p.add_argument("--compression-ratio-threshold", type=float, default=2.4)
+p.add_argument("--logprob-threshold", type=float, default=-1.0)
+p.add_argument("--no-speech-threshold", type=float, default=0.6)
+p.add_argument("--show-model-info", action="store_true")
 p.add_argument("--no-prev-text", action="store_true")
 p.add_argument("--out", type=Path)
 args = p.parse_args()
 
 runner = WhisperBundleRunner(args.artifacts_dir, args.tokenizer_json, args.device)
+if args.show_model_info:
+    for line in runner.whisper_cpp_model_lines():
+        print(line, file=sys.stderr)
 fmt = args.response_format.lower()
 result = runner.run(
     audio=load_audio(args.audio, int(runner.meta["sample_rate"])),
@@ -40,6 +53,14 @@ result = runner.run(
     timestamps=args.timestamps or fmt in {"verbose_json", "srt", "vtt"},
     max_new_tokens=args.max_new_tokens,
     condition_on_previous_text=not args.no_prev_text,
+    temperature=args.temperature,
+    temperature_inc=args.temperature_inc,
+    beam_size=args.beam_size,
+    best_of=args.best_of,
+    length_penalty=args.length_penalty,
+    compression_ratio_threshold=args.compression_ratio_threshold,
+    logprob_threshold=args.logprob_threshold,
+    no_speech_threshold=args.no_speech_threshold,
 )
 out = render_result(result, fmt)
 out = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, indent=2)

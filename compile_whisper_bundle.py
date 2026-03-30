@@ -41,6 +41,15 @@ def parse_args():
         default=128,
         help="Suggested runtime default only. The compiled decoder context uses config.max_target_positions.",
     )
+    parser.add_argument(
+        "--max-decode-batch",
+        type=int,
+        default=8,
+        help=(
+            "Maximum decode batch baked into decode_step. Runtime beam_size/best_of "
+            "must be <= this value."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -409,6 +418,9 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.scale = Tensor.from_const(np.array(self.head_dim**-0.5, dtype=np.float32))
         self.zero_mask = Tensor.from_const(np.zeros((1, 1, 1, 1), dtype=np.float32))
+        self.shift_indices = Tensor.from_const(
+            np.arange(1, max_past_len, dtype=np.int32)
+        )
 
     def _reshape_qkv(self, x: Tensor):
         bsz, seq_len, _ = x.shape
@@ -429,6 +441,7 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         past_v: Tensor,
         past_keep_mask: Tensor,
     ):
+        bsz = hidden_states.shape[0]
         query_states = op.multiply(self.q_proj(hidden_states), self.scale)
         new_k = self.k_proj(hidden_states)
         new_v = self.v_proj(hidden_states)
@@ -437,7 +450,10 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         new_v = self._reshape_qkv(new_v)
         all_k = op.concat([past_k, new_k], dim=2)
         all_v = op.concat([past_v, new_v], dim=2)
-        attn_mask = op.concat([past_keep_mask, self.zero_mask], dim=-1)
+        attn_mask = op.concat(
+            [past_keep_mask, op.broadcast_to(self.zero_mask, [bsz, 1, 1, 1])],
+            dim=-1,
+        )
         attn_weights = op.matmul(
             query_states, op.permute_dims(all_k, axes=[0, 1, 3, 2])
         )
@@ -445,17 +461,24 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         attn_weights = op.softmax(attn_weights, axis=-1)
         attn_output = op.matmul(attn_weights, all_v)
         attn_output = self._merge_heads(attn_output)
-        return self.out_proj(attn_output), new_k, new_v
+        updated_k = op.concat(
+            [op.take(past_k, self.shift_indices, axis=2), new_k], dim=2
+        )
+        updated_v = op.concat(
+            [op.take(past_v, self.shift_indices, axis=2), new_v], dim=2
+        )
+        return self.out_proj(attn_output), updated_k, updated_v
 
 
 class WhisperCrossAttentionStepTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int, max_source_positions: int):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.max_source_positions = max_source_positions
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.scale = Tensor.from_const(np.array(self.head_dim**-0.5, dtype=np.float32))
@@ -473,8 +496,17 @@ class WhisperCrossAttentionStepTVM(nn.Module):
         return x
 
     def forward(self, hidden_states: Tensor, cross_k: Tensor, cross_v: Tensor):
+        bsz = hidden_states.shape[0]
         query_states = op.multiply(self.q_proj(hidden_states), self.scale)
         query_states = self._reshape_qkv(query_states)
+        cross_k = op.broadcast_to(
+            cross_k,
+            [bsz, self.num_heads, self.max_source_positions, self.head_dim],
+        )
+        cross_v = op.broadcast_to(
+            cross_v,
+            [bsz, self.num_heads, self.max_source_positions, self.head_dim],
+        )
         attn_weights = op.matmul(
             query_states, op.permute_dims(cross_k, axes=[0, 1, 3, 2])
         )
@@ -485,10 +517,21 @@ class WhisperCrossAttentionStepTVM(nn.Module):
 
 
 class WhisperDecoderLayerStepTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, ffn_dim: int, max_past_len: int):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        max_past_len: int,
+        max_source_positions: int,
+    ):
         super().__init__()
         self.self_attn = WhisperSelfAttentionStepTVM(embed_dim, num_heads, max_past_len)
-        self.encoder_attn = WhisperCrossAttentionStepTVM(embed_dim, num_heads)
+        self.encoder_attn = WhisperCrossAttentionStepTVM(
+            embed_dim,
+            num_heads,
+            max_source_positions=max_source_positions,
+        )
         self.self_attn_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.encoder_attn_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
         self.fc1 = nn.Linear(embed_dim, ffn_dim, bias=True)
@@ -524,7 +567,7 @@ class WhisperDecoderLayerStepTVM(nn.Module):
 
 
 class WhisperDecoderCachedStepTVM(nn.Module):
-    def __init__(self, config, max_dec_len: int):
+    def __init__(self, config, max_dec_len: int, max_decode_batch: int):
         super().__init__()
         self.vocab_size = int(config.vocab_size)
         self.d_model = int(config.d_model)
@@ -535,6 +578,7 @@ class WhisperDecoderCachedStepTVM(nn.Module):
         self.max_source_positions = int(config.max_source_positions)
         self.max_dec_len = max_dec_len
         self.max_past_len = max_dec_len - 1
+        self.max_decode_batch = max_decode_batch
         self.head_dim = self.d_model // self.decoder_attention_heads
         if max_dec_len > self.max_target_positions:
             raise ValueError("max_dec_len exceeds Whisper config max_target_positions")
@@ -548,6 +592,7 @@ class WhisperDecoderCachedStepTVM(nn.Module):
                 self.decoder_attention_heads,
                 self.decoder_ffn_dim,
                 self.max_past_len,
+                self.max_source_positions,
             )
             setattr(self, f"layer_{i}", layer)
             self.layers.append(layer)
@@ -580,12 +625,22 @@ class WhisperDecoderCachedStepTVM(nn.Module):
             past_k = self._take_layer(
                 self_k_cache,
                 idx,
-                [1, self.decoder_attention_heads, self.max_past_len, self.head_dim],
+                [
+                    self.max_decode_batch,
+                    self.decoder_attention_heads,
+                    self.max_past_len,
+                    self.head_dim,
+                ],
             )
             past_v = self._take_layer(
                 self_v_cache,
                 idx,
-                [1, self.decoder_attention_heads, self.max_past_len, self.head_dim],
+                [
+                    self.max_decode_batch,
+                    self.decoder_attention_heads,
+                    self.max_past_len,
+                    self.head_dim,
+                ],
             )
             cross_k = self._take_layer(
                 cross_k_cache,
@@ -614,7 +669,7 @@ class WhisperDecoderCachedStepTVM(nn.Module):
             new_v_list.append(add_axis0(new_v))
         hidden_states = self.layer_norm(hidden_states)
         logits = self.proj_out(hidden_states)
-        logits = op.reshape(logits, [1, self.vocab_size])
+        logits = op.reshape(logits, [self.max_decode_batch, self.vocab_size])
         return logits, op.concat(new_k_list, dim=0), op.concat(new_v_list, dim=0)
 
 
@@ -622,13 +677,21 @@ class WhisperDecoderCachedStepTVM(nn.Module):
 # WhisperBundle
 # -----------------------------------------------------------------------------
 class WhisperBundle(nn.Module):
-    def __init__(self, config, mel_filters: np.ndarray, max_dec_len: int):
+    def __init__(
+        self,
+        config,
+        mel_filters: np.ndarray,
+        max_dec_len: int,
+        max_decode_batch: int,
+    ):
         super().__init__()
         self.preprocess_mod = WhisperPreprocessTVM(mel_filters)
         self.encoder_mod = WhisperEncoderTVM(config)
         self.cross_kv_mod = WhisperCrossKVCachedTVM(config)
         self.decoder_step_mod = WhisperDecoderCachedStepTVM(
-            config, max_dec_len=max_dec_len
+            config,
+            max_dec_len=max_dec_len,
+            max_decode_batch=max_decode_batch,
         )
 
         self.num_mel_bins = int(config.num_mel_bins)
@@ -637,6 +700,7 @@ class WhisperBundle(nn.Module):
         self.head_dim = int(config.d_model) // int(config.decoder_attention_heads)
         self.max_source_positions = int(config.max_source_positions)
         self.max_dec_len = int(max_dec_len)
+        self.max_decode_batch = int(max_decode_batch)
         self.max_past_len = self.max_dec_len - 1
 
     def preprocess(self, waveform: Tensor, valid_samples: Tensor):
@@ -668,6 +732,17 @@ class WhisperBundle(nn.Module):
             cross_v_cache,
         )
 
+    def gather_self_kv(
+        self,
+        self_k_cache: Tensor,
+        self_v_cache: Tensor,
+        beam_indices: Tensor,
+    ):
+        return (
+            op.take(self_k_cache, beam_indices, axis=1),
+            op.take(self_v_cache, beam_indices, axis=1),
+        )
+
     def get_default_spec(self):
         return nn.spec.ModuleSpec.from_raw(
             {
@@ -694,12 +769,12 @@ class WhisperBundle(nn.Module):
                     "$": {"param_mode": "packed", "effect_mode": "none"},
                 },
                 "decode_step": {
-                    "token_id": nn.spec.Tensor([1, 1], "int32"),
-                    "position_id": nn.spec.Tensor([1, 1], "int32"),
+                    "token_id": nn.spec.Tensor([self.max_decode_batch, 1], "int32"),
+                    "position_id": nn.spec.Tensor([self.max_decode_batch, 1], "int32"),
                     "self_k_cache": nn.spec.Tensor(
                         [
                             self.decoder_layers,
-                            1,
+                            self.max_decode_batch,
                             self.decoder_attention_heads,
                             self.max_past_len,
                             self.head_dim,
@@ -709,7 +784,7 @@ class WhisperBundle(nn.Module):
                     "self_v_cache": nn.spec.Tensor(
                         [
                             self.decoder_layers,
-                            1,
+                            self.max_decode_batch,
                             self.decoder_attention_heads,
                             self.max_past_len,
                             self.head_dim,
@@ -717,7 +792,7 @@ class WhisperBundle(nn.Module):
                         "float32",
                     ),
                     "past_keep_mask": nn.spec.Tensor(
-                        [1, 1, 1, self.max_past_len], "float32"
+                        [self.max_decode_batch, 1, 1, self.max_past_len], "float32"
                     ),
                     "cross_k_cache": nn.spec.Tensor(
                         [
@@ -740,6 +815,30 @@ class WhisperBundle(nn.Module):
                         "float32",
                     ),
                     "$": {"param_mode": "packed", "effect_mode": "none"},
+                },
+                "gather_self_kv": {
+                    "self_k_cache": nn.spec.Tensor(
+                        [
+                            self.decoder_layers,
+                            self.max_decode_batch,
+                            self.decoder_attention_heads,
+                            self.max_past_len,
+                            self.head_dim,
+                        ],
+                        "float32",
+                    ),
+                    "self_v_cache": nn.spec.Tensor(
+                        [
+                            self.decoder_layers,
+                            self.max_decode_batch,
+                            self.decoder_attention_heads,
+                            self.max_past_len,
+                            self.head_dim,
+                        ],
+                        "float32",
+                    ),
+                    "beam_indices": nn.spec.Tensor([self.max_decode_batch], "int32"),
+                    "$": {"param_mode": "none", "effect_mode": "none"},
                 },
             },  # ty:ignore[invalid-argument-type]
             self,
@@ -936,6 +1035,27 @@ def unique_sorted_token_ids(values):
     return sorted(token_ids)
 
 
+def summarize_parameter_dtypes(hf_model: WhisperForConditionalGeneration):
+    dtype_histogram = {}
+    total_elements = 0
+    total_bytes = 0
+    for tensor in hf_model.state_dict().values():
+        dtype_name = str(tensor.dtype).replace("torch.", "")
+        numel = int(tensor.numel())
+        dtype_histogram[dtype_name] = int(dtype_histogram.get(dtype_name, 0) + numel)
+        total_elements += numel
+        total_bytes += int(numel * tensor.element_size())
+    return dtype_histogram, int(total_elements), int(total_bytes)
+
+
+def choose_ftype_name(dtype_histogram: dict[str, int]) -> str:
+    if not dtype_histogram:
+        return "unknown"
+    if len(dtype_histogram) == 1:
+        return next(iter(dtype_histogram))
+    return "mixed"
+
+
 def main():
     args = parse_args()
     out_dir = args.output_dir
@@ -960,6 +1080,7 @@ def main():
             processor.feature_extractor.mel_filters, dtype=np.float32
         ),
         max_dec_len=max_dec_len,
+        max_decode_batch=int(args.max_decode_batch),
     )
     copy_encoder_weights_from_hf(bundle.encoder_mod, hf_model)
     copy_cross_kv_weights_from_hf(bundle.cross_kv_mod, hf_model)
@@ -1010,7 +1131,16 @@ def main():
     transcribe_token_id = token_id_or_none(tokenizer, "<|transcribe|>")
     translate_token_id = token_id_or_none(tokenizer, "<|translate|>")
     startofprev_token_id = token_id_or_none(tokenizer, "<|startofprev|>")
+    no_speech_token_id = token_id_or_none(tokenizer, "<|nospeech|>")
     timestamp_begin = max(int(x) for x in special_ids) + 1
+    param_dtype_histogram, parameter_elements, parameter_bytes = (
+        summarize_parameter_dtypes(hf_model)
+    )
+    ftype_name = choose_ftype_name(param_dtype_histogram)
+    lib_size_bytes = int(lib_path.stat().st_size)
+    params_size_bytes = int(params_path.stat().st_size)
+    tokenizer_size_bytes = int(tokenizer_json_path.stat().st_size)
+    bundle_size_bytes = int(lib_size_bytes + params_size_bytes + tokenizer_size_bytes)
 
     metadata = {
         "model_id": str(args.model_id),
@@ -1025,8 +1155,14 @@ def main():
         "n_frames": N_FRAMES,
         "n_freq": N_FREQ,
         "num_mel_bins": int(hf_model.config.num_mel_bins),
+        "n_mels": int(hf_model.config.num_mel_bins),
         "max_source_positions": int(hf_model.config.max_source_positions),
         "max_target_positions": int(hf_model.config.max_target_positions),
+        "n_audio_ctx": int(hf_model.config.max_source_positions),
+        "n_text_ctx": int(hf_model.config.max_target_positions),
+        "d_model": int(hf_model.config.d_model),
+        "n_audio_state": int(hf_model.config.d_model),
+        "n_text_state": int(hf_model.config.d_model),
         "time_precision": float(
             CHUNK_LENGTH / int(hf_model.config.max_source_positions)
         ),
@@ -1037,12 +1173,16 @@ def main():
         ),
         "max_new_tokens_default": int(max_new_tokens_default),
         "max_dec_len_compiled": int(max_dec_len),
+        "max_decode_batch": int(args.max_decode_batch),
         "decoder_start_token_id": int(decoder_start_token_id),
         "startofprev_token_id": int(startofprev_token_id)
         if startofprev_token_id is not None
         else None,
         "no_timestamps_token_id": int(no_timestamps_token_id)
         if no_timestamps_token_id is not None
+        else None,
+        "no_speech_token_id": int(no_speech_token_id)
+        if no_speech_token_id is not None
         else None,
         "transcribe_token_id": int(transcribe_token_id)
         if transcribe_token_id is not None
@@ -1073,10 +1213,29 @@ def main():
         "default_language_code": "en",
         "default_task": "transcribe",
         "supports_translate": bool(is_multilingual),
+        "encoder_layers": int(hf_model.config.encoder_layers),
+        "encoder_attention_heads": int(hf_model.config.encoder_attention_heads),
+        "n_audio_layer": int(hf_model.config.encoder_layers),
+        "n_audio_head": int(hf_model.config.encoder_attention_heads),
         "decoder_layers": int(hf_model.config.decoder_layers),
         "decoder_attention_heads": int(hf_model.config.decoder_attention_heads),
+        "n_text_layer": int(hf_model.config.decoder_layers),
+        "n_text_head": int(hf_model.config.decoder_attention_heads),
         "head_dim": int(hf_model.config.d_model)
         // int(hf_model.config.decoder_attention_heads),
+        "ftype": ftype_name,
+        "weight_dtype": ftype_name,
+        "qntvr": 0,
+        "quant_scheme": "none",
+        "quant_version": 0,
+        "model_size_bytes": params_size_bytes,
+        "lib_size_bytes": lib_size_bytes,
+        "params_size_bytes": params_size_bytes,
+        "tokenizer_size_bytes": tokenizer_size_bytes,
+        "bundle_size_bytes": bundle_size_bytes,
+        "parameter_elements": parameter_elements,
+        "parameter_bytes": parameter_bytes,
+        "param_dtype_histogram": param_dtype_histogram,
         "param_count": len(param_names),
         "param_names": param_names,
     }
