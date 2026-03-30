@@ -346,6 +346,17 @@ class WhisperBundleRunner:
             and 0 <= int(self.meta["no_timestamps_token_id"]) < self.vocab_size
             else None
         )
+        self.compute_dtype = str(self.meta.get("compute_dtype", "float32"))
+        self.cache_dtype = str(self.meta.get("cache_dtype", "float32"))
+        self.mask_dtype = str(self.meta.get("mask_dtype", "float32"))
+        self.logits_dtype = str(self.meta.get("logits_dtype", "float32"))
+        self.cache_np_dtype = np.dtype(self.cache_dtype)
+        self.mask_np_dtype = np.dtype(self.mask_dtype)
+        self.mask_fill_value = (
+            -1e9
+            if self.mask_np_dtype.itemsize >= np.dtype("float32").itemsize
+            else float(np.finfo(self.mask_np_dtype).min)
+        )
         self.max_past_len = int(self.meta["max_dec_len_compiled"]) - 1
         self.max_decode_batch = int(self.meta.get("max_decode_batch", 1))
         self.self_shape = (
@@ -610,6 +621,9 @@ class WhisperBundleRunner:
             f"whisper_model_load: n_mels        = {int(self.meta.get('n_mels', self.meta.get('num_mel_bins', 0)))}",
             f"whisper_model_load: type          = {model_type or 'unknown'}",
             f"whisper_model_load: ftype         = {self.meta.get('ftype', 'unknown')}",
+            f"whisper_model_load: compute dtype = {self.meta.get('compute_dtype', 'float32')}",
+            f"whisper_model_load: cache dtype   = {self.meta.get('cache_dtype', 'float32')}",
+            f"whisper_model_load: logits dtype  = {self.meta.get('logits_dtype', 'float32')}",
             f"whisper_model_load: qntvr         = {int(self.meta.get('qntvr', 0))}",
             f"whisper_model_load: n_langs       = {len(self.meta.get('language_token_ids', {}))}",
             f"whisper_model_load: model size    = {_format_bytes(model_size)}",
@@ -697,8 +711,8 @@ class WhisperBundleRunner:
         return unwrap(cross_k), unwrap(cross_v), int(valid[0])
 
     def _zero_self_cache(self):
-        self_k = to_tvm(np.zeros(self.self_shape, dtype=np.float32), self.dev)
-        self_v = to_tvm(np.zeros(self.self_shape, dtype=np.float32), self.dev)
+        self_k = to_tvm(np.zeros(self.self_shape, dtype=self.cache_np_dtype), self.dev)
+        self_v = to_tvm(np.zeros(self.self_shape, dtype=self.cache_np_dtype), self.dev)
         return self_k, self_v
 
     def _make_past_keep_mask(
@@ -706,8 +720,8 @@ class WhisperBundleRunner:
     ) -> np.ndarray:
         mask = np.full(
             (self.max_decode_batch, 1, 1, self.max_past_len),
-            -1e9,
-            dtype=np.float32,
+            self.mask_fill_value,
+            dtype=self.mask_np_dtype,
         )
         for i in range(min(active_count, len(positions))):
             keep = max(0, min(int(positions[i]), self.max_past_len))

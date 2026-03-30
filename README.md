@@ -67,11 +67,22 @@ python compile_whisper_bundle.py \
   --target cpu
 ```
 
+To enable fp16 for encoder/decoder:
+
+```bash
+python compile_whisper_bundle.py \
+  --model-id openai/whisper-tiny \
+  --output-dir ./artifacts/whisper-tiny-fp16 \
+  --target cuda \
+  --dtype float16
+```
+
 Options:
 
 - `--model-id`: Hugging Face model ID.
 - `--output-dir`: directory for the compiled bundle.
 - `--target`: `cpu` or `cuda`.
+- `--dtype`: compile dtype for encoder/decoder weights and KV cache. `float32` or `float16`. `float16` is currently supported only with `--target cuda`. The TVM-native preprocess path and decode logits remain `float32`.
 - `--max-new-tokens`: runtime default stored in metadata. The compiled decoder still uses `config.max_target_positions`.
 - `--max-decode-batch`: maximum runtime batch for decoder-side beam search / best-of. `beam_size` and `best_of` must be less than or equal to this value.
 

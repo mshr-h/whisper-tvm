@@ -23,6 +23,37 @@ N_FRAMES = N_SAMPLES // HOP_LENGTH  # 3000
 N_FREQ = 1 + N_FFT // 2  # 201
 REFLECT_PAD = N_FFT // 2  # 200
 
+PREPROCESS_DTYPE = "float32"
+MASK_DTYPE = "float32"
+LOGITS_DTYPE = "float32"
+ATTN_SOFTMAX_DTYPE = "float32"
+
+
+def normalize_dtype_name(dtype: str) -> str:
+    dtype_name = str(dtype).strip().lower()
+    if dtype_name not in {"float32", "float16"}:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return dtype_name
+
+
+def numpy_dtype(dtype: str):
+    return np.dtype(normalize_dtype_name(dtype))
+
+
+def tensor_const(data, dtype: str | None = None) -> Tensor:
+    if dtype is None:
+        return Tensor.from_const(np.asarray(data))
+    return Tensor.from_const(np.asarray(data, dtype=numpy_dtype(dtype)))
+
+
+def tensor_scalar(value: float, dtype: str) -> Tensor:
+    return Tensor.from_scalar(float(value), normalize_dtype_name(dtype))
+
+
+def maybe_cast(x: Tensor, dtype: str) -> Tensor:
+    dtype = normalize_dtype_name(dtype)
+    return x if x.dtype == dtype else op.astype(x, dtype)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -35,6 +66,16 @@ def parse_args():
     parser.add_argument("--model-id", default="openai/whisper-tiny")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--target", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16"],
+        default="float32",
+        help=(
+            "Compile dtype for encoder/decoder weights and KV cache. "
+            "float16 is currently supported only with --target cuda. "
+            f"Preprocess, mask, and logits remain {PREPROCESS_DTYPE}/{MASK_DTYPE}/{LOGITS_DTYPE}."
+        ),
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -189,7 +230,7 @@ def make_stft_conv_kernels(n_fft: int = N_FFT, n_freq: int = N_FREQ):
 class WhisperPreprocessTVM(nn.Module):
     def __init__(self, mel_filters: np.ndarray):
         super().__init__()
-        mel_filters = np.asarray(mel_filters, dtype=np.float32)
+        mel_filters = np.asarray(mel_filters, dtype=numpy_dtype(PREPROCESS_DTYPE))
         if mel_filters.ndim != 2:
             raise ValueError(f"Unexpected mel filter rank: {mel_filters.shape}")
         if mel_filters.shape[0] != N_FREQ and mel_filters.shape[1] == N_FREQ:
@@ -199,20 +240,18 @@ class WhisperPreprocessTVM(nn.Module):
         self.num_mel_bins = int(mel_filters.shape[1])
 
         real_kernel, imag_kernel = make_stft_conv_kernels()
-        self.reflect_indices = Tensor.from_const(make_reflect_indices())
-        self.keep_frame_indices = Tensor.from_const(np.arange(N_FRAMES, dtype=np.int32))
-        self.frame_starts = Tensor.from_const(
+        self.reflect_indices = tensor_const(make_reflect_indices())
+        self.keep_frame_indices = tensor_const(np.arange(N_FRAMES, dtype=np.int32))
+        self.frame_starts = tensor_const(
             np.arange(0, N_SAMPLES, HOP_LENGTH, dtype=np.int32).reshape(1, N_FRAMES)
         )
-        self.real_kernel = Tensor.from_const(real_kernel)
-        self.imag_kernel = Tensor.from_const(imag_kernel)
-        self.mel_filters = Tensor.from_const(mel_filters)
-        self.log_eps = Tensor.from_const(np.array(1e-10, dtype=np.float32))
-        self.inv_ln10 = Tensor.from_const(
-            np.array(1.0 / math.log(10.0), dtype=np.float32)
-        )
-        self.eight = Tensor.from_const(np.array(8.0, dtype=np.float32))
-        self.four = Tensor.from_const(np.array(4.0, dtype=np.float32))
+        self.real_kernel = tensor_const(real_kernel, PREPROCESS_DTYPE)
+        self.imag_kernel = tensor_const(imag_kernel, PREPROCESS_DTYPE)
+        self.mel_filters = tensor_const(mel_filters, PREPROCESS_DTYPE)
+        self.log_eps = tensor_scalar(1e-10, PREPROCESS_DTYPE)
+        self.inv_ln10 = tensor_scalar(1.0 / math.log(10.0), PREPROCESS_DTYPE)
+        self.eight = tensor_scalar(8.0, PREPROCESS_DTYPE)
+        self.four = tensor_scalar(4.0, PREPROCESS_DTYPE)
 
     def forward(self, waveform: Tensor, valid_samples: Tensor):
         x = op.take(waveform, self.reflect_indices, axis=1)
@@ -242,18 +281,27 @@ class WhisperPreprocessTVM(nn.Module):
 # TVM-native encoder
 # -----------------------------------------------------------------------------
 class WhisperAttentionTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int, dtype: str = "float32"):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.scale = Tensor.from_const(np.array(self.head_dim**-0.5, dtype=np.float32))
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.q_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.k_proj = nn.Linear(
+            embed_dim, embed_dim, bias=False, dtype=self.compute_dtype
+        )
+        self.v_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.out_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.scale = tensor_scalar(self.head_dim**-0.5, self.compute_dtype)
 
     def _reshape_qkv(self, x: Tensor):
         bsz, seq_len, _ = x.shape
@@ -277,22 +325,35 @@ class WhisperAttentionTVM(nn.Module):
         attn_weights = op.matmul(
             query_states, op.permute_dims(key_states, axes=[0, 1, 3, 2])
         )
+        attn_weights = maybe_cast(attn_weights, ATTN_SOFTMAX_DTYPE)
         if attention_mask is not None:
-            attn_weights = op.add(attn_weights, attention_mask)
+            attn_weights = op.add(
+                attn_weights, maybe_cast(attention_mask, ATTN_SOFTMAX_DTYPE)
+            )
         attn_weights = op.softmax(attn_weights, axis=-1)
+        attn_weights = maybe_cast(attn_weights, self.compute_dtype)
         attn_output = op.matmul(attn_weights, value_states)
         attn_output = self._merge_heads(attn_output)
         return self.out_proj(attn_output)
 
 
 class WhisperEncoderLayerTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, ffn_dim: int):
+    def __init__(
+        self, embed_dim: int, num_heads: int, ffn_dim: int, dtype: str = "float32"
+    ):
         super().__init__()
-        self.self_attn = WhisperAttentionTVM(embed_dim, num_heads)
-        self.self_attn_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.fc1 = nn.Linear(embed_dim, ffn_dim, bias=True)
-        self.fc2 = nn.Linear(ffn_dim, embed_dim, bias=True)
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.self_attn = WhisperAttentionTVM(
+            embed_dim, num_heads, dtype=self.compute_dtype
+        )
+        self.self_attn_layer_norm = nn.LayerNorm(
+            embed_dim, eps=1e-5, dtype=self.compute_dtype
+        )
+        self.fc1 = nn.Linear(embed_dim, ffn_dim, bias=True, dtype=self.compute_dtype)
+        self.fc2 = nn.Linear(ffn_dim, embed_dim, bias=True, dtype=self.compute_dtype)
+        self.final_layer_norm = nn.LayerNorm(
+            embed_dim, eps=1e-5, dtype=self.compute_dtype
+        )
 
     def forward(self, hidden_states: Tensor):
         residual = hidden_states
@@ -309,8 +370,9 @@ class WhisperEncoderLayerTVM(nn.Module):
 
 
 class WhisperEncoderTVM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype: str = "float32"):
         super().__init__()
+        self.compute_dtype = normalize_dtype_name(dtype)
         self.num_mel_bins = int(config.num_mel_bins)
         self.d_model = int(config.d_model)
         self.max_source_positions = int(config.max_source_positions)
@@ -324,24 +386,39 @@ class WhisperEncoderTVM(nn.Module):
             stride=1,
             padding=1,
             bias=True,
+            dtype=self.compute_dtype,
         )
         self.conv2 = nn.Conv1D(
-            self.d_model, self.d_model, kernel_size=3, stride=2, padding=1, bias=True
+            self.d_model,
+            self.d_model,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=True,
+            dtype=self.compute_dtype,
         )
-        self.embed_positions = nn.Embedding(self.max_source_positions, self.d_model)
+        self.embed_positions = nn.Embedding(
+            self.max_source_positions,
+            self.d_model,
+            dtype=self.compute_dtype,
+        )
         self.layers = []
         for i in range(self.encoder_layers):
             layer = WhisperEncoderLayerTVM(
-                self.d_model, self.encoder_attention_heads, self.encoder_ffn_dim
+                self.d_model,
+                self.encoder_attention_heads,
+                self.encoder_ffn_dim,
+                dtype=self.compute_dtype,
             )
             setattr(self, f"layer_{i}", layer)
             self.layers.append(layer)
-        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-5)
-        self.position_ids = Tensor.from_const(
+        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-5, dtype=self.compute_dtype)
+        self.position_ids = tensor_const(
             np.arange(self.max_source_positions, dtype=np.int32)[None, :]
         )
 
     def forward(self, input_features: Tensor):
+        input_features = maybe_cast(input_features, self.compute_dtype)
         hidden_states = self.conv1(input_features)
         hidden_states = op.gelu(hidden_states)
         hidden_states = self.conv2(hidden_states)
@@ -357,15 +434,20 @@ class WhisperEncoderTVM(nn.Module):
 # TVM-native cross-KV and cached decoder-step
 # -----------------------------------------------------------------------------
 class WhisperCrossKVLayerTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int, dtype: str = "float32"):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.k_proj = nn.Linear(
+            embed_dim, embed_dim, bias=False, dtype=self.compute_dtype
+        )
+        self.v_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
 
     def _reshape_qkv(self, x: Tensor):
         bsz, seq_len, _ = x.shape
@@ -380,8 +462,9 @@ class WhisperCrossKVLayerTVM(nn.Module):
 
 
 class WhisperCrossKVCachedTVM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype: str = "float32"):
         super().__init__()
+        self.compute_dtype = normalize_dtype_name(dtype)
         self.d_model = int(config.d_model)
         self.decoder_layers = int(config.decoder_layers)
         self.decoder_attention_heads = int(config.decoder_attention_heads)
@@ -389,7 +472,11 @@ class WhisperCrossKVCachedTVM(nn.Module):
         self.max_source_positions = int(config.max_source_positions)
         self.layers = []
         for i in range(self.decoder_layers):
-            layer = WhisperCrossKVLayerTVM(self.d_model, self.decoder_attention_heads)
+            layer = WhisperCrossKVLayerTVM(
+                self.d_model,
+                self.decoder_attention_heads,
+                dtype=self.compute_dtype,
+            )
             setattr(self, f"layer_{i}", layer)
             self.layers.append(layer)
 
@@ -404,7 +491,13 @@ class WhisperCrossKVCachedTVM(nn.Module):
 
 
 class WhisperSelfAttentionStepTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, max_past_len: int):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        max_past_len: int,
+        dtype: str = "float32",
+    ):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
@@ -412,15 +505,24 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.max_past_len = max_past_len
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.scale = Tensor.from_const(np.array(self.head_dim**-0.5, dtype=np.float32))
-        self.zero_mask = Tensor.from_const(np.zeros((1, 1, 1, 1), dtype=np.float32))
-        self.shift_indices = Tensor.from_const(
-            np.arange(1, max_past_len, dtype=np.int32)
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.q_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
         )
+        self.k_proj = nn.Linear(
+            embed_dim, embed_dim, bias=False, dtype=self.compute_dtype
+        )
+        self.v_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.out_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.scale = tensor_scalar(self.head_dim**-0.5, self.compute_dtype)
+        self.zero_mask = tensor_const(
+            np.zeros((1, 1, 1, 1), dtype=np.float32), MASK_DTYPE
+        )
+        self.shift_indices = tensor_const(np.arange(1, max_past_len, dtype=np.int32))
 
     def _reshape_qkv(self, x: Tensor):
         bsz, seq_len, _ = x.shape
@@ -457,8 +559,10 @@ class WhisperSelfAttentionStepTVM(nn.Module):
         attn_weights = op.matmul(
             query_states, op.permute_dims(all_k, axes=[0, 1, 3, 2])
         )
+        attn_weights = maybe_cast(attn_weights, ATTN_SOFTMAX_DTYPE)
         attn_weights = op.add(attn_weights, attn_mask)
         attn_weights = op.softmax(attn_weights, axis=-1)
+        attn_weights = maybe_cast(attn_weights, self.compute_dtype)
         attn_output = op.matmul(attn_weights, all_v)
         attn_output = self._merge_heads(attn_output)
         updated_k = op.concat(
@@ -471,7 +575,13 @@ class WhisperSelfAttentionStepTVM(nn.Module):
 
 
 class WhisperCrossAttentionStepTVM(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, max_source_positions: int):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        max_source_positions: int,
+        dtype: str = "float32",
+    ):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
@@ -479,9 +589,14 @@ class WhisperCrossAttentionStepTVM(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.max_source_positions = max_source_positions
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.scale = Tensor.from_const(np.array(self.head_dim**-0.5, dtype=np.float32))
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.q_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.out_proj = nn.Linear(
+            embed_dim, embed_dim, bias=True, dtype=self.compute_dtype
+        )
+        self.scale = tensor_scalar(self.head_dim**-0.5, self.compute_dtype)
 
     def _reshape_qkv(self, x: Tensor):
         bsz, seq_len, _ = x.shape
@@ -510,7 +625,9 @@ class WhisperCrossAttentionStepTVM(nn.Module):
         attn_weights = op.matmul(
             query_states, op.permute_dims(cross_k, axes=[0, 1, 3, 2])
         )
+        attn_weights = maybe_cast(attn_weights, ATTN_SOFTMAX_DTYPE)
         attn_weights = op.softmax(attn_weights, axis=-1)
+        attn_weights = maybe_cast(attn_weights, self.compute_dtype)
         attn_output = op.matmul(attn_weights, cross_v)
         attn_output = self._merge_heads(attn_output)
         return self.out_proj(attn_output)
@@ -524,19 +641,33 @@ class WhisperDecoderLayerStepTVM(nn.Module):
         ffn_dim: int,
         max_past_len: int,
         max_source_positions: int,
+        dtype: str = "float32",
     ):
         super().__init__()
-        self.self_attn = WhisperSelfAttentionStepTVM(embed_dim, num_heads, max_past_len)
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.self_attn = WhisperSelfAttentionStepTVM(
+            embed_dim,
+            num_heads,
+            max_past_len,
+            dtype=self.compute_dtype,
+        )
         self.encoder_attn = WhisperCrossAttentionStepTVM(
             embed_dim,
             num_heads,
             max_source_positions=max_source_positions,
+            dtype=self.compute_dtype,
         )
-        self.self_attn_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.encoder_attn_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.fc1 = nn.Linear(embed_dim, ffn_dim, bias=True)
-        self.fc2 = nn.Linear(ffn_dim, embed_dim, bias=True)
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.self_attn_layer_norm = nn.LayerNorm(
+            embed_dim, eps=1e-5, dtype=self.compute_dtype
+        )
+        self.encoder_attn_layer_norm = nn.LayerNorm(
+            embed_dim, eps=1e-5, dtype=self.compute_dtype
+        )
+        self.fc1 = nn.Linear(embed_dim, ffn_dim, bias=True, dtype=self.compute_dtype)
+        self.fc2 = nn.Linear(ffn_dim, embed_dim, bias=True, dtype=self.compute_dtype)
+        self.final_layer_norm = nn.LayerNorm(
+            embed_dim, eps=1e-5, dtype=self.compute_dtype
+        )
 
     def forward(
         self,
@@ -567,8 +698,15 @@ class WhisperDecoderLayerStepTVM(nn.Module):
 
 
 class WhisperDecoderCachedStepTVM(nn.Module):
-    def __init__(self, config, max_dec_len: int, max_decode_batch: int):
+    def __init__(
+        self,
+        config,
+        max_dec_len: int,
+        max_decode_batch: int,
+        dtype: str = "float32",
+    ):
         super().__init__()
+        self.compute_dtype = normalize_dtype_name(dtype)
         self.vocab_size = int(config.vocab_size)
         self.d_model = int(config.d_model)
         self.max_target_positions = int(config.max_target_positions)
@@ -582,8 +720,16 @@ class WhisperDecoderCachedStepTVM(nn.Module):
         self.head_dim = self.d_model // self.decoder_attention_heads
         if max_dec_len > self.max_target_positions:
             raise ValueError("max_dec_len exceeds Whisper config max_target_positions")
-        self.embed_tokens = nn.Embedding(self.vocab_size, self.d_model)
-        self.embed_positions = nn.Embedding(self.max_target_positions, self.d_model)
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size,
+            self.d_model,
+            dtype=self.compute_dtype,
+        )
+        self.embed_positions = nn.Embedding(
+            self.max_target_positions,
+            self.d_model,
+            dtype=self.compute_dtype,
+        )
         self.layers = []
         self.layer_take_indices = []
         for i in range(self.decoder_layers):
@@ -593,14 +739,21 @@ class WhisperDecoderCachedStepTVM(nn.Module):
                 self.decoder_ffn_dim,
                 self.max_past_len,
                 self.max_source_positions,
+                dtype=self.compute_dtype,
             )
             setattr(self, f"layer_{i}", layer)
             self.layers.append(layer)
             self.layer_take_indices.append(
-                Tensor.from_const(np.asarray([i], dtype=np.int32))
+                tensor_const(np.asarray([i], dtype=np.int32))
             )
-        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-5)
-        self.proj_out = nn.Linear(self.d_model, self.vocab_size, bias=False)
+        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-5, dtype=self.compute_dtype)
+        self.proj_out = nn.Linear(
+            self.d_model,
+            self.vocab_size,
+            bias=False,
+            dtype=self.compute_dtype,
+            out_dtype=LOGITS_DTYPE,
+        )
 
     def _take_layer(self, stacked: Tensor, layer_index: Tensor, out_shape):
         x = op.take(stacked, layer_index, axis=0)
@@ -683,15 +836,22 @@ class WhisperBundle(nn.Module):
         mel_filters: np.ndarray,
         max_dec_len: int,
         max_decode_batch: int,
+        dtype: str = "float32",
     ):
         super().__init__()
+        self.compute_dtype = normalize_dtype_name(dtype)
+        self.cache_dtype = self.compute_dtype
+        self.preprocess_dtype = PREPROCESS_DTYPE
+        self.mask_dtype = MASK_DTYPE
+        self.logits_dtype = LOGITS_DTYPE
         self.preprocess_mod = WhisperPreprocessTVM(mel_filters)
-        self.encoder_mod = WhisperEncoderTVM(config)
-        self.cross_kv_mod = WhisperCrossKVCachedTVM(config)
+        self.encoder_mod = WhisperEncoderTVM(config, dtype=self.compute_dtype)
+        self.cross_kv_mod = WhisperCrossKVCachedTVM(config, dtype=self.compute_dtype)
         self.decoder_step_mod = WhisperDecoderCachedStepTVM(
             config,
             max_dec_len=max_dec_len,
             max_decode_batch=max_decode_batch,
+            dtype=self.compute_dtype,
         )
 
         self.num_mel_bins = int(config.num_mel_bins)
@@ -747,13 +907,13 @@ class WhisperBundle(nn.Module):
         return nn.spec.ModuleSpec.from_raw(
             {
                 "preprocess": {
-                    "waveform": nn.spec.Tensor([1, N_SAMPLES], "float32"),
+                    "waveform": nn.spec.Tensor([1, N_SAMPLES], self.preprocess_dtype),
                     "valid_samples": nn.spec.Tensor([1], "int32"),
                     "$": {"param_mode": "none", "effect_mode": "none"},
                 },
                 "encode": {
                     "input_features": nn.spec.Tensor(
-                        [1, self.num_mel_bins, N_FRAMES], "float32"
+                        [1, self.num_mel_bins, N_FRAMES], self.preprocess_dtype
                     ),
                     "$": {"param_mode": "packed", "effect_mode": "none"},
                 },
@@ -764,7 +924,7 @@ class WhisperBundle(nn.Module):
                             self.max_source_positions,
                             self.decoder_attention_heads * self.head_dim,
                         ],
-                        "float32",
+                        self.compute_dtype,
                     ),
                     "$": {"param_mode": "packed", "effect_mode": "none"},
                 },
@@ -779,7 +939,7 @@ class WhisperBundle(nn.Module):
                             self.max_past_len,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "self_v_cache": nn.spec.Tensor(
                         [
@@ -789,10 +949,11 @@ class WhisperBundle(nn.Module):
                             self.max_past_len,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "past_keep_mask": nn.spec.Tensor(
-                        [self.max_decode_batch, 1, 1, self.max_past_len], "float32"
+                        [self.max_decode_batch, 1, 1, self.max_past_len],
+                        self.mask_dtype,
                     ),
                     "cross_k_cache": nn.spec.Tensor(
                         [
@@ -802,7 +963,7 @@ class WhisperBundle(nn.Module):
                             self.max_source_positions,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "cross_v_cache": nn.spec.Tensor(
                         [
@@ -812,7 +973,7 @@ class WhisperBundle(nn.Module):
                             self.max_source_positions,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "$": {"param_mode": "packed", "effect_mode": "none"},
                 },
@@ -825,7 +986,7 @@ class WhisperBundle(nn.Module):
                             self.max_past_len,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "self_v_cache": nn.spec.Tensor(
                         [
@@ -835,7 +996,7 @@ class WhisperBundle(nn.Module):
                             self.max_past_len,
                             self.head_dim,
                         ],
-                        "float32",
+                        self.cache_dtype,
                     ),
                     "beam_indices": nn.spec.Tensor([self.max_decode_batch], "int32"),
                     "$": {"param_mode": "none", "effect_mode": "none"},
@@ -1035,16 +1196,22 @@ def unique_sorted_token_ids(values):
     return sorted(token_ids)
 
 
-def summarize_parameter_dtypes(hf_model: WhisperForConditionalGeneration):
+def summarize_parameter_dtypes(named_params):
     dtype_histogram = {}
     total_elements = 0
     total_bytes = 0
-    for tensor in hf_model.state_dict().values():
-        dtype_name = str(tensor.dtype).replace("torch.", "")
-        numel = int(tensor.numel())
+    for name, param in named_params:
+        del name
+        if param.data is None:
+            raise ValueError("Found unbound parameter while summarizing dtypes")
+        tensor = param.data
+        dtype_name = str(tensor.dtype)
+        numel = 1
+        for dim in tensor.shape:
+            numel *= int(dim)
         dtype_histogram[dtype_name] = int(dtype_histogram.get(dtype_name, 0) + numel)
         total_elements += numel
-        total_bytes += int(numel * tensor.element_size())
+        total_bytes += int(numel * np.dtype(dtype_name).itemsize)
     return dtype_histogram, int(total_elements), int(total_bytes)
 
 
@@ -1058,6 +1225,11 @@ def choose_ftype_name(dtype_histogram: dict[str, int]) -> str:
 
 def main():
     args = parse_args()
+    compile_dtype = normalize_dtype_name(args.dtype)
+    if compile_dtype == "float16" and args.target != "cuda":
+        raise ValueError(
+            "--dtype float16 is currently supported only with --target cuda"
+        )
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1077,10 +1249,12 @@ def main():
     bundle = WhisperBundle(
         hf_model.config,
         mel_filters=np.asarray(
-            processor.feature_extractor.mel_filters, dtype=np.float32
+            processor.feature_extractor.mel_filters,
+            dtype=numpy_dtype(PREPROCESS_DTYPE),
         ),
         max_dec_len=max_dec_len,
         max_decode_batch=int(args.max_decode_batch),
+        dtype=compile_dtype,
     )
     copy_encoder_weights_from_hf(bundle.encoder_mod, hf_model)
     copy_cross_kv_weights_from_hf(bundle.cross_kv_mod, hf_model)
@@ -1088,6 +1262,9 @@ def main():
 
     target = build_target(args.target)
     mod, named_params = bundle.export_tvm(spec=bundle.get_default_spec())
+    param_dtype_histogram, parameter_elements, parameter_bytes = (
+        summarize_parameter_dtypes(named_params)
+    )
     compile_kwargs = {"target": target}
     if target.kind.name == "cuda":
         compile_kwargs["tir_pipeline"] = get_s_tir_pipeline()
@@ -1133,9 +1310,6 @@ def main():
     startofprev_token_id = token_id_or_none(tokenizer, "<|startofprev|>")
     no_speech_token_id = token_id_or_none(tokenizer, "<|nospeech|>")
     timestamp_begin = max(int(x) for x in special_ids) + 1
-    param_dtype_histogram, parameter_elements, parameter_bytes = (
-        summarize_parameter_dtypes(hf_model)
-    )
     ftype_name = choose_ftype_name(param_dtype_histogram)
     lib_size_bytes = int(lib_path.stat().st_size)
     params_size_bytes = int(params_path.stat().st_size)
@@ -1174,6 +1348,12 @@ def main():
         "max_new_tokens_default": int(max_new_tokens_default),
         "max_dec_len_compiled": int(max_dec_len),
         "max_decode_batch": int(args.max_decode_batch),
+        "compile_dtype": compile_dtype,
+        "compute_dtype": bundle.compute_dtype,
+        "cache_dtype": bundle.cache_dtype,
+        "mask_dtype": bundle.mask_dtype,
+        "logits_dtype": bundle.logits_dtype,
+        "preprocess_dtype": bundle.preprocess_dtype,
         "decoder_start_token_id": int(decoder_start_token_id),
         "startofprev_token_id": int(startofprev_token_id)
         if startofprev_token_id is not None
