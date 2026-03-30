@@ -1531,7 +1531,12 @@ class WhisperBundleRunner:
         return last_attempt
 
     def build_segments(
-        self, ids: Sequence[int], offset_s: float, valid_samples: int, timestamps: bool
+        self,
+        ids: Sequence[int],
+        offset_s: float,
+        valid_samples: int,
+        timestamps: bool,
+        is_last_window: bool = False,
     ):
         ids = [int(x) for x in ids]
         if not ids:
@@ -1552,11 +1557,19 @@ class WhisperBundleRunner:
                 if text.strip()
                 else []
             ), valid_samples
+
         arr = np.asarray(ids, dtype=np.int64)
         ts_mask = arr >= self.timestamp_begin
         pair_ends = np.where(ts_mask[:-1] & ts_mask[1:])[0] + 1
         tail_is_single_ts = arr.size >= 2 and ts_mask[-2:].tolist() == [False, True]
+
+        sr = float(self.meta["sample_rate"])
+        time_precision = float(self.meta["time_precision"])
+        samples_per_timestamp = int(self.meta["samples_per_timestamp"])
+        window_end_s = float(offset_s + valid_samples / sr)
+
         segments, advance = [], valid_samples
+
         if len(pair_ends) > 0:
             last = 0
             for cur in pair_ends.tolist() + ([len(arr)] if tail_is_single_ts else []):
@@ -1564,15 +1577,12 @@ class WhisperBundleRunner:
                 last = cur
                 if len(part) <= 1:
                     continue
+
                 a = float(
-                    offset_s
-                    + (int(part[0]) - self.timestamp_begin)
-                    * float(self.meta["time_precision"])
+                    offset_s + (int(part[0]) - self.timestamp_begin) * time_precision
                 )
                 b = float(
-                    offset_s
-                    + (int(part[-1]) - self.timestamp_begin)
-                    * float(self.meta["time_precision"])
+                    offset_s + (int(part[-1]) - self.timestamp_begin) * time_precision
                 )
                 text = self.decode_text(part.tolist())
                 if b > a and text.strip():
@@ -1584,19 +1594,64 @@ class WhisperBundleRunner:
                             "tokens": [int(x) for x in part],
                         }
                     )
-            if not tail_is_single_ts and last > 0:
+
+            # final-chunk rescue:
+            # if there is still an unprocessed suffix after the last timestamp pair,
+            # consume it in this window instead of re-seeking a tiny tail window.
+            if is_last_window and not tail_is_single_ts and last < len(arr):
+                tail = arr[last:]
+                tail_text = self.decode_text(tail.tolist())
+
+                if tail_text.strip():
+                    tail_ts = tail[tail >= self.timestamp_begin]
+                    if len(tail_ts) > 0:
+                        tail_start = float(
+                            offset_s
+                            + (int(tail_ts[0]) - self.timestamp_begin) * time_precision
+                        )
+                    else:
+                        tail_start = (
+                            float(segments[-1]["end"]) if segments else float(offset_s)
+                        )
+
+                    # If the suffix itself ends with a timestamp token, use that.
+                    # Otherwise this is the final window, so extend to the window end.
+                    if (
+                        tail.size > 0
+                        and int(tail[-1]) >= self.timestamp_begin
+                        and int(tail[-1]) != self.timestamp_begin
+                    ):
+                        tail_end = float(
+                            offset_s
+                            + (int(tail[-1]) - self.timestamp_begin) * time_precision
+                        )
+                    else:
+                        tail_end = window_end_s
+
+                    if tail_end > tail_start:
+                        segments.append(
+                            {
+                                "start": tail_start,
+                                "end": tail_end,
+                                "text": tail_text,
+                                "tokens": [int(x) for x in tail],
+                            }
+                        )
+
+                advance = valid_samples
+
+            elif not tail_is_single_ts and last > 0:
                 advance = int(
-                    (int(arr[last - 1]) - self.timestamp_begin)
-                    * int(self.meta["samples_per_timestamp"])
+                    (int(arr[last - 1]) - self.timestamp_begin) * samples_per_timestamp
                 )
+
         else:
-            end_s = float(offset_s + valid_samples / float(self.meta["sample_rate"]))
+            end_s = window_end_s
             ts_only = arr[ts_mask]
             if len(ts_only) > 0 and int(ts_only[-1]) != self.timestamp_begin:
                 end_s = float(
                     offset_s
-                    + (int(ts_only[-1]) - self.timestamp_begin)
-                    * float(self.meta["time_precision"])
+                    + (int(ts_only[-1]) - self.timestamp_begin) * time_precision
                 )
             text = self.decode_text(ids)
             if end_s > offset_s and text.strip():
@@ -1608,10 +1663,9 @@ class WhisperBundleRunner:
                         "tokens": ids,
                     }
                 )
+
         if advance <= 0:
-            advance = min(
-                valid_samples, max(1, int(self.meta["samples_per_timestamp"]))
-            )
+            advance = min(valid_samples, max(1, samples_per_timestamp))
         return segments, int(advance)
 
     def run(
@@ -1675,7 +1729,11 @@ class WhisperBundleRunner:
                 )
                 ids = attempt.tokens
                 window_segments, advance = self.build_segments(
-                    ids, seek / float(sr), valid, timestamps
+                    ids,
+                    seek / float(sr),
+                    valid,
+                    timestamps,
+                    is_last_window=(seek + valid) >= len(audio),
                 )
                 seek_advance = int(
                     (advance if timestamps else valid)
