@@ -47,6 +47,46 @@ class DecodeAttempt:
     no_speech_prob: float
     temperature: float
     strategy: str
+    stop_reason: str = "unknown"
+    generated_len: int = 0
+    returned_len: int = 0
+    last_token_id: int | None = None
+    last_is_timestamp: bool = False
+    ended_with_eos: bool = False
+    fallback_compression_ratio: bool = False
+    fallback_logprob: bool = False
+    silence: bool = False
+    finished_hypotheses: int = 0
+    active_hypotheses: int = 0
+
+
+@dataclass
+class DecodeWindowTrace:
+    index: int
+    seek_samples: int
+    valid_samples: int
+    prompt_len: int
+    max_new_tokens: int
+    generated_len: int
+    returned_len: int
+    stop_reason: str
+    strategy: str
+    temperature: float
+    last_token_id: int | None
+    last_is_timestamp: bool
+    ended_with_eos: bool
+    fallback_compression_ratio: bool
+    fallback_logprob: bool
+    silence: bool
+    finished_hypotheses: int
+    active_hypotheses: int
+    avg_logprob: float
+    compression_ratio: float
+    no_speech_prob: float
+    timestamps: bool
+    segment_count: int
+    advance_samples: int
+    text_chars: int
 
 
 @dataclass
@@ -78,6 +118,8 @@ class BundlePerfStats:
     fallbacks_compression_ratio: int = 0
     fallbacks_logprob: int = 0
     silence_skips: int = 0
+    stop_reason_counts: dict[str, int] = field(default_factory=dict)
+    windows: list[DecodeWindowTrace] = field(default_factory=list)
 
 
 def choose_device(name: str = "auto"):
@@ -326,11 +368,6 @@ class WhisperBundleRunner:
         )
         return self.last_perf
 
-    def _ensure_perf(self) -> BundlePerfStats:
-        if self.last_perf is None:
-            raise RuntimeError("Performance collection is not enabled.")
-        return self.last_perf
-
     def _sync_device(self):
         sync = getattr(self.dev, "sync", None)
         if callable(sync):
@@ -350,6 +387,61 @@ class WhisperBundleRunner:
             return
         metric = getattr(self.last_perf, name)
         metric.add(elapsed_ms, runs=runs)
+
+    def _record_stop_reason(self, stop_reason: str):
+        if self.last_perf is None:
+            return
+        key = str(stop_reason or "unknown")
+        self.last_perf.stop_reason_counts[key] = (
+            int(self.last_perf.stop_reason_counts.get(key, 0)) + 1
+        )
+
+    def _record_window_trace(
+        self,
+        *,
+        seek_samples: int,
+        valid_samples: int,
+        prompt_len: int,
+        max_new_tokens: int,
+        attempt: DecodeAttempt,
+        timestamps: bool,
+        segment_count: int,
+        advance_samples: int,
+        text_chars: int,
+    ):
+        if self.last_perf is None:
+            return
+        trace = DecodeWindowTrace(
+            index=len(self.last_perf.windows),
+            seek_samples=int(seek_samples),
+            valid_samples=int(valid_samples),
+            prompt_len=int(prompt_len),
+            max_new_tokens=int(max_new_tokens),
+            generated_len=int(attempt.generated_len),
+            returned_len=int(attempt.returned_len),
+            stop_reason=str(attempt.stop_reason or "unknown"),
+            strategy=str(attempt.strategy),
+            temperature=float(attempt.temperature),
+            last_token_id=(
+                None if attempt.last_token_id is None else int(attempt.last_token_id)
+            ),
+            last_is_timestamp=bool(attempt.last_is_timestamp),
+            ended_with_eos=bool(attempt.ended_with_eos),
+            fallback_compression_ratio=bool(attempt.fallback_compression_ratio),
+            fallback_logprob=bool(attempt.fallback_logprob),
+            silence=bool(attempt.silence),
+            finished_hypotheses=int(attempt.finished_hypotheses),
+            active_hypotheses=int(attempt.active_hypotheses),
+            avg_logprob=float(attempt.avg_logprob),
+            compression_ratio=float(attempt.compression_ratio),
+            no_speech_prob=float(attempt.no_speech_prob),
+            timestamps=bool(timestamps),
+            segment_count=int(segment_count),
+            advance_samples=int(advance_samples),
+            text_chars=int(text_chars),
+        )
+        self.last_perf.windows.append(trace)
+        self._record_stop_reason(trace.stop_reason)
 
     def _cpu_capability(self) -> str | None:
         try:
@@ -447,6 +539,51 @@ class WhisperBundleRunner:
             lines.insert(7, self._format_perf_line("lang detect", perf.lang_detect))
         if perf.silence_skips:
             lines.append(f"whisper_print_timings: silence skips = {perf.silence_skips}")
+        if perf.stop_reason_counts:
+            summary = " | ".join(
+                f"{key} = {perf.stop_reason_counts[key]}"
+                for key in sorted(perf.stop_reason_counts)
+            )
+            lines.append(f"whisper_print_timings: stop reasons = {summary}")
+        return lines
+
+    def whisper_cpp_decode_debug_lines(self) -> list[str]:
+        perf = self.last_perf
+        if perf is None:
+            return []
+        sample_rate = max(1, int(self.meta.get("sample_rate", 16000)))
+        lines: list[str] = []
+        for trace in perf.windows:
+            last_token_id = (
+                -1 if trace.last_token_id is None else int(trace.last_token_id)
+            )
+            lines.append(
+                "whisper_decode_debug: "
+                f"window = {trace.index} | "
+                f"seek = {trace.seek_samples} ({trace.seek_samples / float(sample_rate):.2f} s) | "
+                f"valid = {trace.valid_samples} | "
+                f"prompt = {trace.prompt_len} | "
+                f"max_new = {trace.max_new_tokens} | "
+                f"generated = {trace.generated_len} | "
+                f"returned = {trace.returned_len} | "
+                f"stop = {trace.stop_reason} | "
+                f"strategy = {trace.strategy} | "
+                f"temp = {trace.temperature:.2f} | "
+                f"last = {last_token_id} | "
+                f"last_is_ts = {1 if trace.last_is_timestamp else 0} | "
+                f"ended_with_eos = {1 if trace.ended_with_eos else 0} | "
+                f"fallback_cr = {1 if trace.fallback_compression_ratio else 0} | "
+                f"fallback_lp = {1 if trace.fallback_logprob else 0} | "
+                f"silence = {1 if trace.silence else 0} | "
+                f"finished = {trace.finished_hypotheses} | "
+                f"active = {trace.active_hypotheses} | "
+                f"avg_logprob = {trace.avg_logprob:.3f} | "
+                f"compression_ratio = {trace.compression_ratio:.3f} | "
+                f"no_speech = {trace.no_speech_prob:.3f} | "
+                f"segments = {trace.segment_count} | "
+                f"advance = {trace.advance_samples} | "
+                f"text_chars = {trace.text_chars}"
+            )
         return lines
 
     def whisper_cpp_model_lines(self) -> list[str]:
@@ -542,21 +679,21 @@ class WhisperBundleRunner:
     def load_window(self, audio: np.ndarray, start: int):
         wave, valid = self._slice_window(audio, start)
         pp, elapsed_ms = self._time_call(
-            lambda: self.vm["preprocess"](
-                to_tvm(wave, self.dev), to_tvm(valid, self.dev)
+            lambda: unwrap_many(
+                self.vm["preprocess"](to_tvm(wave, self.dev), to_tvm(valid, self.dev))
             )
         )
         self._record_metric("mel", elapsed_ms)
-        feats, _ = unwrap_many(pp)
+        feats, _ = pp
         enc, elapsed_ms = self._time_call(
             lambda: unwrap(self.vm["encode"](feats, self.params))
         )
         self._record_metric("encode", elapsed_ms)
         cross, elapsed_ms = self._time_call(
-            lambda: self.vm["cross_kv"](enc, self.params)
+            lambda: unwrap_many(self.vm["cross_kv"](enc, self.params))
         )
         self._record_metric("cross_kv", elapsed_ms)
-        cross_k, cross_v = unwrap_many(cross)
+        cross_k, cross_v = cross
         return unwrap(cross_k), unwrap(cross_v), int(valid[0])
 
     def _zero_self_cache(self):
@@ -588,6 +725,7 @@ class WhisperBundleRunner:
         cross_v,
         *,
         record_perf: bool = True,
+        time_op: bool = True,
     ):
         active_count = len(token_ids)
         if active_count <= 0:
@@ -601,8 +739,9 @@ class WhisperBundleRunner:
         token_pad[:active_count, 0] = np.asarray(token_ids, dtype=np.int32)
         position_pad[:active_count, 0] = np.asarray(positions, dtype=np.int32)
         mask = self._make_past_keep_mask(positions, active_count)
-        out, elapsed_ms = self._time_call(
-            lambda: self.vm["decode_step"](
+
+        def _run_decode_step():
+            out = self.vm["decode_step"](
                 to_tvm(token_pad, self.dev),
                 to_tvm(position_pad, self.dev),
                 self_k,
@@ -612,17 +751,30 @@ class WhisperBundleRunner:
                 cross_v,
                 self.params,
             )
-        )
+            logits, next_k, next_v = unwrap_many(out)
+            return (
+                np.asarray(unwrap(logits).numpy(), dtype=np.float32)[:active_count],
+                unwrap(next_k),
+                unwrap(next_v),
+            )
+
+        if time_op:
+            result, elapsed_ms = self._time_call(_run_decode_step)
+        else:
+            result = _run_decode_step()
+            elapsed_ms = 0.0
         if record_perf:
             self._record_metric("decode" if active_count == 1 else "batchd", elapsed_ms)
-        logits, next_k, next_v = unwrap_many(out)
-        return (
-            np.asarray(unwrap(logits).numpy(), dtype=np.float32)[:active_count],
-            unwrap(next_k),
-            unwrap(next_v),
-        )
+        return result
 
-    def _gather_self_kv(self, self_k, self_v, parent_indices: Sequence[int]):
+    def _gather_self_kv(
+        self,
+        self_k,
+        self_v,
+        parent_indices: Sequence[int],
+        *,
+        metric_name: str | None = None,
+    ):
         active_count = len(parent_indices)
         if active_count <= 0:
             raise ValueError("parent_indices must be non-empty")
@@ -632,12 +784,18 @@ class WhisperBundleRunner:
             )
         gather = np.zeros((self.max_decode_batch,), dtype=np.int32)
         gather[:active_count] = np.asarray(parent_indices, dtype=np.int32)
-        out = self.vm["gather_self_kv"](
-            self_k,
-            self_v,
-            to_tvm(gather, self.dev),
+        out, elapsed_ms = self._time_call(
+            lambda: unwrap_many(
+                self.vm["gather_self_kv"](
+                    self_k,
+                    self_v,
+                    to_tvm(gather, self.dev),
+                )
+            )
         )
-        next_k, next_v = unwrap_many(out)
+        if metric_name is not None:
+            self._record_metric(metric_name, elapsed_ms, runs=0)
+        next_k, next_v = out
         return unwrap(next_k), unwrap(next_v)
 
     def _prime_batch(
@@ -664,6 +822,7 @@ class WhisperBundleRunner:
                     cross_k,
                     cross_v,
                     record_perf=False,
+                    time_op=False,
                 )
             if logits is None:
                 raise RuntimeError("Failed to prime decoder.")
@@ -870,6 +1029,11 @@ class WhisperBundleRunner:
                 no_speech_prob=float(no_speech_prob),
                 temperature=float(temperature),
                 strategy=strategy,
+                generated_len=0,
+                returned_len=0,
+                last_token_id=None,
+                last_is_timestamp=False,
+                ended_with_eos=False,
             )
         best = max(
             candidates,
@@ -879,9 +1043,10 @@ class WhisperBundleRunner:
                 length_penalty,
             ),
         )
-        tokens = [int(x) for x in best.tokens]
-        if tokens and tokens[-1] == self.eos:
-            tokens = tokens[:-1]
+        raw_tokens = [int(x) for x in best.tokens]
+        last_token_id = raw_tokens[-1] if raw_tokens else None
+        ended_with_eos = bool(last_token_id == self.eos)
+        tokens = raw_tokens[:-1] if ended_with_eos else raw_tokens
         text = self.decode_text(tokens)
         return DecodeAttempt(
             tokens=tokens,
@@ -891,6 +1056,13 @@ class WhisperBundleRunner:
             no_speech_prob=float(no_speech_prob),
             temperature=float(temperature),
             strategy=strategy,
+            generated_len=len(raw_tokens),
+            returned_len=len(tokens),
+            last_token_id=last_token_id,
+            last_is_timestamp=bool(
+                last_token_id is not None and last_token_id >= self.timestamp_begin
+            ),
+            ended_with_eos=ended_with_eos,
         )
 
     def _decode_sampling(
@@ -911,6 +1083,8 @@ class WhisperBundleRunner:
             n_samples,
         )
         no_speech_prob = self._token_probability(logits[0], self.no_speech_token_id)
+        stop_reason = "max_new_tokens"
+        eos_seen = False
         active = [
             DecodeHypothesis(
                 tokens=[],
@@ -923,6 +1097,7 @@ class WhisperBundleRunner:
         finished: list[DecodeHypothesis] = []
         for _ in range(max_new_tokens):
             if not active:
+                stop_reason = "eos" if eos_seen else "no_active_hypotheses"
                 break
             parent_indices: list[int] = []
             next_tokens: list[int] = []
@@ -944,6 +1119,7 @@ class WhisperBundleRunner:
                     position=int(hyp.position + 1),
                 )
                 if next_id == self.eos:
+                    eos_seen = True
                     finished.append(child)
                     continue
                 parent_indices.append(parent_idx)
@@ -956,9 +1132,16 @@ class WhisperBundleRunner:
                 runs=decisions,
             )
             if not next_tokens:
+                stop_reason = "eos" if eos_seen else "all_logits_filtered"
                 active = []
                 break
-            parent_k, parent_v = self._gather_self_kv(self_k, self_v, parent_indices)
+            metric_name = "decode" if len(next_tokens) == 1 else "batchd"
+            parent_k, parent_v = self._gather_self_kv(
+                self_k,
+                self_v,
+                parent_indices,
+                metric_name=metric_name,
+            )
             logits, self_k, self_v = self._decode_step_batch(
                 next_tokens,
                 positions,
@@ -977,13 +1160,17 @@ class WhisperBundleRunner:
             if temperature > 0
             else "greedy"
         )
-        return self._finalize_attempt(
+        attempt = self._finalize_attempt(
             [*finished, *active],
             no_speech_prob,
             temperature,
             strategy,
             length_penalty,
         )
+        attempt.stop_reason = stop_reason
+        attempt.finished_hypotheses = len(finished)
+        attempt.active_hypotheses = len(active)
+        return attempt
 
     def _decode_beam_search(
         self,
@@ -997,6 +1184,8 @@ class WhisperBundleRunner:
     ) -> DecodeAttempt:
         logits, self_k, self_v, pos = self._prime_batch(prompt_ids, cross_k, cross_v, 1)
         no_speech_prob = self._token_probability(logits[0], self.no_speech_token_id)
+        stop_reason = "max_new_tokens"
+        eos_seen = False
         active = [
             DecodeHypothesis(
                 tokens=[],
@@ -1008,6 +1197,7 @@ class WhisperBundleRunner:
         finished: list[DecodeHypothesis] = []
         for _ in range(max_new_tokens):
             if not active:
+                stop_reason = "eos" if eos_seen else "no_active_hypotheses"
                 break
             finished_candidates: list[DecodeHypothesis] = []
             active_candidates: list[tuple[float, int, int, int, DecodeHypothesis]] = []
@@ -1033,6 +1223,7 @@ class WhisperBundleRunner:
                         position=int(hyp.position + 1),
                     )
                     if int(next_id) == self.eos:
+                        eos_seen = True
                         finished_candidates.append(child)
                     else:
                         active_candidates.append(
@@ -1055,7 +1246,12 @@ class WhisperBundleRunner:
             )
             if finished_candidates:
                 finished.extend(finished_candidates)
+                if len(finished) >= beam_size:
+                    stop_reason = "beam_finished"
+                    active = []
+                    break
             if not active_candidates:
+                stop_reason = "eos" if eos_seen else "all_logits_filtered"
                 active = []
                 break
             active_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -1064,7 +1260,13 @@ class WhisperBundleRunner:
             next_tokens = [cand[2] for cand in survivors]
             positions = [cand[3] for cand in survivors]
             next_active = [cand[4] for cand in survivors]
-            parent_k, parent_v = self._gather_self_kv(self_k, self_v, parent_indices)
+            metric_name = "decode" if len(next_tokens) == 1 else "batchd"
+            parent_k, parent_v = self._gather_self_kv(
+                self_k,
+                self_v,
+                parent_indices,
+                metric_name=metric_name,
+            )
             logits, self_k, self_v = self._decode_step_batch(
                 next_tokens,
                 positions,
@@ -1076,13 +1278,17 @@ class WhisperBundleRunner:
             for i, hyp in enumerate(next_active):
                 hyp.next_logits = np.asarray(logits[i], dtype=np.float32)
             active = next_active
-        return self._finalize_attempt(
+        attempt = self._finalize_attempt(
             [*finished, *active],
             no_speech_prob,
             0.0,
             "beam_search",
             length_penalty,
         )
+        attempt.stop_reason = stop_reason
+        attempt.finished_hypotheses = len(finished)
+        attempt.active_hypotheses = len(active)
+        return attempt
 
     def _decode_once(
         self,
@@ -1159,9 +1365,11 @@ class WhisperBundleRunner:
         max_new_tokens: int,
         timestamps: bool,
         cfg: DecodeConfig,
-    ) -> list[int]:
+    ) -> DecodeAttempt:
         temperatures = self._temperature_schedule(cfg.temperature, cfg.temperature_inc)
         last_attempt: DecodeAttempt | None = None
+        fallback_cr_seen = False
+        fallback_lp_seen = False
         for temperature in temperatures:
             attempt = self._decode_once(
                 cross_k,
@@ -1173,18 +1381,45 @@ class WhisperBundleRunner:
                 temperature,
             )
             last_attempt = attempt
+            compression_ratio, logprob = self._fallback_reasons(attempt, cfg)
+            fallback_cr_seen = bool(fallback_cr_seen or compression_ratio)
+            fallback_lp_seen = bool(fallback_lp_seen or logprob)
+            attempt.fallback_compression_ratio = bool(fallback_cr_seen)
+            attempt.fallback_logprob = bool(fallback_lp_seen)
             if self._should_skip_silence(attempt, cfg):
                 if self.last_perf is not None:
                     self.last_perf.silence_skips += 1
-                return []
-            compression_ratio, logprob = self._fallback_reasons(attempt, cfg)
+                attempt.stop_reason = "silence"
+                attempt.silence = True
+                return attempt
             if temperature != temperatures[-1] and (compression_ratio or logprob):
                 if self.last_perf is not None:
                     self.last_perf.fallbacks_compression_ratio += int(compression_ratio)
                     self.last_perf.fallbacks_logprob += int(logprob)
                 continue
-            return attempt.tokens
-        return [] if last_attempt is None else list(last_attempt.tokens)
+            return attempt
+        if last_attempt is None:
+            return DecodeAttempt(
+                tokens=[],
+                sum_logprob=0.0,
+                avg_logprob=0.0,
+                compression_ratio=0.0,
+                no_speech_prob=0.0,
+                temperature=float(cfg.temperature),
+                strategy="unknown",
+                stop_reason="empty",
+                generated_len=0,
+                returned_len=0,
+                last_token_id=None,
+                last_is_timestamp=False,
+                ended_with_eos=False,
+                fallback_compression_ratio=bool(fallback_cr_seen),
+                fallback_logprob=bool(fallback_lp_seen),
+                silence=False,
+            )
+        last_attempt.fallback_compression_ratio = bool(fallback_cr_seen)
+        last_attempt.fallback_logprob = bool(fallback_lp_seen)
+        return last_attempt
 
     def build_segments(
         self, ids: Sequence[int], offset_s: float, valid_samples: int, timestamps: bool
@@ -1320,26 +1555,42 @@ class WhisperBundleRunner:
                     timestamps,
                     history if condition_on_previous_text else [],
                 )
-                ids = self.decode_window(
+                window_max_new_tokens = self.max_new_tokens(max_new_tokens, len(prompt))
+                attempt = self.decode_window(
                     cross_k,
                     cross_v,
                     prompt,
-                    self.max_new_tokens(max_new_tokens, len(prompt)),
+                    window_max_new_tokens,
                     timestamps,
                     cfg,
                 )
+                ids = attempt.tokens
                 window_segments, advance = self.build_segments(
                     ids, seek / float(sr), valid, timestamps
+                )
+                seek_advance = int(
+                    (advance if timestamps else valid)
+                    or min(valid, int(self.meta["samples_per_timestamp"]))
+                )
+                self._record_window_trace(
+                    seek_samples=seek,
+                    valid_samples=valid,
+                    prompt_len=len(prompt),
+                    max_new_tokens=window_max_new_tokens,
+                    attempt=attempt,
+                    timestamps=timestamps,
+                    segment_count=len(window_segments),
+                    advance_samples=seek_advance,
+                    text_chars=sum(
+                        len(str(s.get("text", ""))) for s in window_segments
+                    ),
                 )
                 for s in window_segments:
                     s["id"] = len(segments)
                     segments.append(s)
                     if condition_on_previous_text:
                         history.extend(int(x) for x in s["tokens"])
-                seek += int(
-                    (advance if timestamps else valid)
-                    or min(valid, int(self.meta["samples_per_timestamp"]))
-                )
+                seek += seek_advance
                 if len(audio) == 0:
                     break
             detected = detected or str(self.meta.get("default_language_code", "en"))

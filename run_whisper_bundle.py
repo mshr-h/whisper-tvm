@@ -57,6 +57,7 @@ p.add_argument("--no-speech-threshold", type=float, default=0.6)
 p.add_argument("--show-model-info", action="store_true")
 p.add_argument("--show-system-info", action="store_true")
 p.add_argument("--show-perf", "--show-timings", action="store_true")
+p.add_argument("--show-decode-debug", action="store_true")
 p.add_argument("--no-prev-text", action="store_true")
 p.add_argument("--out", type=Path)
 args = p.parse_args()
@@ -109,11 +110,14 @@ result = runner.run(
     compression_ratio_threshold=args.compression_ratio_threshold,
     logprob_threshold=args.logprob_threshold,
     no_speech_threshold=args.no_speech_threshold,
-    collect_perf=args.show_perf,
+    collect_perf=args.show_perf or args.show_decode_debug,
 )
 
 if args.show_perf:
     for line in runner.whisper_cpp_timing_lines():
+        print(line, file=sys.stderr)
+if args.show_decode_debug:
+    for line in runner.whisper_cpp_decode_debug_lines():
         print(line, file=sys.stderr)
 
 out = render_result(result, fmt)

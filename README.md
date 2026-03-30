@@ -56,7 +56,7 @@ uv venv
 uv python -m pip install -r requirements.txt
 ```
 
-Install Apache TVM separately in the same environment. You can installe it via: `./build-tvm.sh --cuda --clean --llvm llvm-config`.
+Install Apache TVM separately in the same environment. You can install it via: `./build-tvm.sh --cuda --clean --llvm llvm-config`.
 
 ## Compile a bundle
 
@@ -101,6 +101,25 @@ python run_whisper_bundle.py \
   --show-perf
 ```
 
+Beam-search / timestamp comparison close to the common `whisper.cpp` CLI example:
+
+```bash
+python run_whisper_bundle.py \
+  --artifacts-dir ./artifacts/whisper-base \
+  --audio ./jfk.wav \
+  --device cuda \
+  --task transcribe \
+  --language en \
+  --timestamps \
+  --beam-size 5 \
+  --best-of 5 \
+  --temperature 0 \
+  --show-model-info \
+  --show-system-info \
+  --show-perf \
+  --show-decode-debug
+```
+
 Useful options:
 
 - `--device auto|cpu|cuda`
@@ -120,6 +139,7 @@ Useful options:
 - `--show-model-info`
 - `--show-system-info`
 - `--show-perf` / `--show-timings`
+- `--show-decode-debug`
 - `--no-prev-text`
 - `--out PATH`
 
@@ -127,7 +147,8 @@ Notes:
 
 - `verbose_json`, `srt`, and `vtt` automatically enable timestamps.
 - For `--task translate`, the CLI ignores `--language` and lets the runtime detect the source language.
-- `--show-model-info`, `--show-system-info`, and `--show-perf` print whisper.cpp-style diagnostic lines to stderr so stdout can still be redirected or written with `--out`.
+- `--show-model-info`, `--show-system-info`, `--show-perf`, and `--show-decode-debug` print diagnostic lines to stderr so stdout can still be redirected or written with `--out`.
+- `--show-decode-debug` is useful when a decode window stops on `max_new_tokens`, `silence`, or a fallback path and you want to inspect the exact stop reason.
 - Audio decoding is done with `soundfile`. Only formats supported by `soundfile` / `libsndfile` are expected to work.
 
 ## Start the REST server
